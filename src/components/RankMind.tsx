@@ -936,6 +936,7 @@ function Dashboard({setPage,gscData:_gscData,ga4Data:_ga4Data,aeoData:_aeoData,s
   // One-click handoff: seed the SEO Campaign Agent with this gap keyword + active domain
   const seedBlog = (keyword:string) => {
     localStorage.setItem("rm_campaign_seed", JSON.stringify({ keyword, domain }));
+    window.dispatchEvent(new Event("rm-campaign-seed"));
     setPage("seoagent");
   };
   // Handoff to On-Page checker: resolve the ACTUAL ranking page for this keyword (GSC), not the homepage
@@ -2928,7 +2929,7 @@ FORMAT: plain readable text only. Do NOT use markdown symbols — no #, no ##, n
               const slug=(title||kw||"article").toLowerCase().replace(/[^a-z0-9]+/g,"-").replace(/^-|-$/g,"").slice(0,70);
               const schema=JSON.stringify({"@context":"https://schema.org","@type":"Article",headline:title.slice(0,110),description:plain.slice(0,160),...(dom?{publisher:{"@type":"Organization",name:dom}}:{})});
               const seed={title,keyword:kw,domain:dom,article_html:html,meta_title:title.slice(0,60),meta_description:plain.slice(0,155),slug,schema_article:schema};
-              try{localStorage.setItem("rm_campaign_publish_seed",JSON.stringify(seed));}catch{}
+              try{localStorage.setItem("rm_campaign_publish_seed",JSON.stringify(seed));window.dispatchEvent(new Event("rm-campaign-seed"));}catch{}
               if(setPage)setPage("campaign");
             }} style={{fontSize:11,fontWeight:700,color:"#fff",background:"linear-gradient(135deg,#6366f1,#818cf8)",border:"none",borderRadius:5,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit"}}>🚀 Publish via Campaign Agent →</button>}
           </div>}/>
@@ -8801,7 +8802,7 @@ Base word count on SERP average ±10%. 6-8 outline sections derived from common 
   // ── Handoff: push SERP findings into the SEO Campaign Agent (seed → navigate) ──
   const seedCampaign = (seed:Record<string,unknown>) => {
     const dom = extractDomain(userUrl||activeSite||"");
-    try{ localStorage.setItem("rm_campaign_seed", JSON.stringify({source:"serp", domain:dom, ...seed})); }catch{}
+    try{ localStorage.setItem("rm_campaign_seed", JSON.stringify({source:"serp", domain:dom, ...seed})); window.dispatchEvent(new Event("rm-campaign-seed")); }catch{}
     if(setPage) setPage("campaign");
   };
   // Build a single-keyword seed from a SERP result (+ optional generated brief)
@@ -9235,7 +9236,10 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
   // Handoff → pre-fill domain + a starter brief. Two sources:
   //  • Dashboard "✍️ Blog" buttons → {keyword, domain} (a GSC content gap)
   //  • Content SERP Analyzer → rich SERP-grounded seed (single keyword or bulk top opportunities)
-  useEffect(()=>{
+  // Extracted (not inlined in the effect) so it can also be re-run from the event listener
+  // below — this page stays mounted once visited (see the app's keep-alive tab strategy),
+  // so a mount-only effect would miss any seed written by a later handoff in the same session.
+  const loadCampaignSeed = () => {
     const raw=localStorage.getItem("rm_campaign_seed");
     if(!raw)return;
     localStorage.removeItem("rm_campaign_seed");
@@ -9284,9 +9288,10 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
         }
       }
     }catch{/* ignore malformed seed */}
-  },[]);
+  };
+  useEffect(()=>{ loadCampaignSeed(); },[]);
   // Handoff from the Content Writer → a ready-made article jumps straight to Gate 2 (publish).
-  useEffect(()=>{
+  const loadPublishSeed = () => {
     const raw=localStorage.getItem("rm_campaign_publish_seed");
     if(!raw)return;
     localStorage.removeItem("rm_campaign_publish_seed");
@@ -9302,6 +9307,17 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
       setApproved(new Set([0]));
       setPhase(4);
     }catch{/* ignore malformed seed */}
+  };
+  useEffect(()=>{ loadPublishSeed(); },[]);
+  // This page is kept mounted once visited (the app never unmounts a visited tab, only
+  // hides it), so a handoff written *after* that first mount would otherwise be missed —
+  // the seed-loading effects above only ever fire once. Seed-writers dispatch this event
+  // right after their localStorage.setItem so an already-mounted tab still picks it up.
+  useEffect(()=>{
+    const onSeed=()=>{ loadCampaignSeed(); loadPublishSeed(); };
+    window.addEventListener("rm-campaign-seed",onSeed);
+    return ()=>window.removeEventListener("rm-campaign-seed",onSeed);
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
   },[]);
   // phase: 0 input · 1 strategy review · 2 gate1 (suggestions) · 3 generating · 4 gate2 (content) · 5 published
   const [phase,setPhase]=useState(0);
