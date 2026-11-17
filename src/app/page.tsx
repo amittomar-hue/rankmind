@@ -31,9 +31,19 @@ export default function Home() {
           // Merge server state into localStorage WITHOUT deleting local-only keys (so tool
           // history that exists only in this browser isn't wiped). History is append-only →
           // merge by entry id; other keys take the server value.
+          // A project switch writes rm_active_site then reloads. If that reload beats the
+          // server save, hydrating the stale server value would silently revert the choice —
+          // so a locally-stamped switch from the last 2 minutes always wins.
+          const recentSwitch = (() => {
+            try {
+              const ts = Number(localStorage.getItem("rm_switch_ts") || 0);
+              return ts > 0 && Date.now() - ts < 120000;
+            } catch { return false; }
+          })();
           try {
             for (const [k, v] of Object.entries(state)) {
               if (typeof v !== "string") continue;
+              if (k === "rm_active_site" && recentSwitch) continue;   // keep the user's just-made choice
               if (k.startsWith("rm_hist_")) {
                 try {
                   // eslint-disable-next-line @typescript-eslint/no-explicit-any

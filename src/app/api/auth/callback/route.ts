@@ -54,10 +54,13 @@ export async function GET(req: NextRequest) {
   // ── Per-domain token map ──────────────────────────────────────────────
   // Merge new tokens into existing map so each domain keeps its own creds
   if (domain) {
-    let tokenMap: Record<string, { access_token: string; refresh_token?: string }> = {};
+    let tokenMap: Record<string, { access_token: string; refresh_token?: string; ts?: number }> = {};
     try { tokenMap = JSON.parse(cookieStore.get("gsc_tokens")?.value || "{}"); } catch {}
     tokenMap[domain] = {
       access_token: tokens.access_token,
+      // Issue time — /api/gsc uses it to refresh before Google's ~1h expiry rather than
+      // sending a dead token and surfacing the rejection as a sign-in loop.
+      ts: Date.now(),
       ...(tokens.refresh_token ? { refresh_token: tokens.refresh_token } : {}),
       // If re-authing same domain with no new refresh_token, keep the old one
       ...(tokenMap[domain]?.refresh_token && !tokens.refresh_token

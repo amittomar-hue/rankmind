@@ -1,5 +1,5 @@
 // Shared AI call helper
-// Priority chain: Claude key1 → Claude key2 → Groq → DuckDuckGo AI (free, keyless)
+// Priority chain: Groq → Claude key1 → Claude key2 → Gemini → DuckDuckGo AI (keyless) → scrape
 
 const isRateLimit = (msg: string) =>
   /rate.?limit|token.*per.*(day|minute)|tpd|tpm|quota|overloaded|529|capacity|credit.*balance|insufficient.*credit|billing|balance.*too.*low|out of credit/i.test(msg);
@@ -27,7 +27,10 @@ async function callClaudeWithKey(key: string, prompt: string, maxTokens: number)
 // ── Groq ──────────────────────────────────────────────────────────────────────
 // Groq rate limits are PER-MODEL — when one model's daily quota is exhausted,
 // fall back to another model with its own separate quota.
-const GROQ_MODELS = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "meta-llama/llama-4-scout-17b-16e-instruct", "qwen/qwen3-32b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"];
+// Groq decommissioned llama-3.3-70b-versatile and llama-3.1-8b-instant on 2026-08-16, and
+// qwen3-32b and llama-4-scout on 2026-07-17. Keeping dead ids in the chain wasted a request
+// each AND masked the real failure, because callGroq only ever reported the LAST error.
+const GROQ_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"];
 
 async function callGroqModel(key: string, model: string, prompt: string, maxTokens: number, jsonMode: boolean): Promise<string> {
   const body: Record<string, unknown> = {
@@ -54,17 +57,70 @@ async function callGroqModel(key: string, model: string, prompt: string, maxToke
 async function callGroq(prompt: string, maxTokens: number, jsonMode: boolean): Promise<string> {
   const key = (process.env.GROQ_API_KEY || "").trim();
   if (!key) throw new Error("GROQ_API_KEY not configured");
-  let lastErr = "";
+  // Report EVERY model's failure, not just the last one. Reporting only the last error hid
+  // the real cause whenever a trailing model in the chain failed for a different reason.
+  const errs: string[] = [];
   for (const model of GROQ_MODELS) {
     try {
       return await callGroqModel(key, model, prompt, maxTokens, jsonMode);
     } catch (e) {
-      lastErr = e instanceof Error ? e.message : String(e);
+      const msg = e instanceof Error ? e.message : String(e);
+      errs.push(`${model}: ${msg.slice(0, 90)}`);
       // Roll to next model on rate-limit/capacity/model errors; otherwise bubble up
-      if (!isRateLimit(lastErr) && !/model.*(not found|decommission|unavailable)|does not exist|400/i.test(lastErr)) throw e;
+      if (!isRateLimit(msg) && !/model.*(not found|decommission|unavailable)|does not exist|400/i.test(msg)) throw e;
     }
   }
-  throw new Error(lastErr || "Groq: all models exhausted");
+  throw new Error(errs.join(" ; ") || "Groq: all models exhausted");
+}
+
+// ── Google AI Studio / Gemini ────────────────────────────────────────────────
+// The GOOGLE_AI_STUDIO_KEY was already configured for image generation but was never
+// wired into the text chain, so an outage at Groq + Anthropic fell straight through to
+// DuckDuckGo. Gemini now sits between them as a real, keyed provider.
+const GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
+
+function geminiKey(): string {
+  return (process.env.GOOGLE_AI_STUDIO_KEY || process.env.GEMINI_API_KEY || "").replace(/^﻿/, "").trim();
+}
+
+async function callGeminiModel(key: string, model: string, prompt: string, maxTokens: number, jsonMode: boolean): Promise<string> {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: Math.min(Math.max(Number(maxTokens) || 4096, 512), 32768),
+        temperature: 0.7,
+        ...(jsonMode ? { responseMimeType: "application/json" } : {}),
+      },
+    }),
+    signal: AbortSignal.timeout(85000),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({})) as Record<string, unknown>;
+    throw new Error((err.error as Record<string, unknown>)?.message as string || `Gemini error ${r.status}`);
+  }
+  const data = await r.json() as { candidates?: { content?: { parts?: { text?: string }[] } }[] };
+  const out = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  if (!out) throw new Error("Gemini: empty response");
+  return out;
+}
+
+async function callGemini(prompt: string, maxTokens: number, jsonMode: boolean): Promise<string> {
+  const key = geminiKey();
+  if (!key) throw new Error("GOOGLE_AI_STUDIO_KEY not configured");
+  const errs: string[] = [];
+  for (const model of GEMINI_MODELS) {
+    try {
+      return await callGeminiModel(key, model, prompt, maxTokens, jsonMode);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      errs.push(`${model}: ${msg.slice(0, 90)}`);
+      if (!isRateLimit(msg) && !/not found|unavailable|does not exist|400|404/i.test(msg)) throw e;
+    }
+  }
+  throw new Error(errs.join(" ; ") || "Gemini: all models exhausted");
 }
 
 // ── DuckDuckGo AI Chat (free, no API key needed, GPT-4o-mini) ─────────────────
@@ -176,7 +232,20 @@ export async function callAI(prompt: string, maxTokens = 4096, jsonMode = true):
     }
   }
 
-  // 3. DuckDuckGo AI Chat — free, no key, GPT-4o-mini
+  // 3. Gemini (Google AI Studio) — keyed provider, tried before the keyless scrapers
+  if (geminiKey()) {
+    try {
+      return await callGemini(p, maxTokens, jsonMode);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("Gemini failed:", msg);
+      fails.push(`Gemini: ${msg.slice(0, 140)}`);
+    }
+  } else {
+    fails.push("Gemini: GOOGLE_AI_STUDIO_KEY not set");
+  }
+
+  // 4. DuckDuckGo AI Chat — free, no key, GPT-4o-mini
   try {
     return await callDDGChat(p);
   } catch (e) {
@@ -185,7 +254,7 @@ export async function callAI(prompt: string, maxTokens = 4096, jsonMode = true):
     fails.push(`DDG: ${msg.slice(0, 120)}`);
   }
 
-  // 4. Web scrape fallback (text responses only)
+  // 5. Web scrape fallback (text responses only)
   if (!jsonMode) {
     try {
       return await callPerplexityScrape(p);

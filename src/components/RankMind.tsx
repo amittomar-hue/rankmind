@@ -71,6 +71,7 @@ function useToolHistory(tool: string) {
 const NAV_CATEGORIES = [
   { label:"OVERVIEW", items:[
     {id:"dashboard",icon:"⬡",label:"Dashboard"},
+    {id:"seoengine",icon:"⚡",label:"SEO Opportunity Engine"},
     {id:"execaudit",icon:"◈",label:"SEO Audit Report"},
     {id:"projects",icon:"⊡",label:"My Sites"},
     {id:"history",icon:"◷",label:"History"},
@@ -561,10 +562,22 @@ function ProjectBar({activeSite, setPage}: {activeSite?: string; setPage?: (p: s
     set.add(clean(domain));
     return [...set].filter(Boolean).sort();
   })();
-  // Switch site: persist + reload so every tool re-initialises with the new active site
-  const change = (s:string)=>{
+  // Switch site: persist + reload so every tool re-initialises with the new active site.
+  // The reload races the workspace sync: hydration on the next load overwrites EVERY synced
+  // key from the server, and the debounced save had not run yet — so the new project was
+  // silently reverted to the server's stale value. Push the change to the account first,
+  // and stamp it locally so hydration can refuse to clobber a just-made choice even if the
+  // save fails (offline, request dropped).
+  const change = async (s:string)=>{
     if(!s || s===domain) return;
-    try{ localStorage.setItem("rm_active_site", s); }catch{}
+    try{
+      localStorage.setItem("rm_active_site", s);
+      localStorage.setItem("rm_switch_ts", String(Date.now()));
+    }catch{}
+    try{
+      await fetch("/api/userstate",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({state:snapshotSyncState()})});
+    }catch{ /* stamp above still protects the choice through hydration */ }
     window.location.reload();
   };
   return (
@@ -751,6 +764,1066 @@ const fmtNumGlobal = (n: number) => n>=1000000?`${(n/1000000).toFixed(1)}M`:n>=1
 
 
 // ── Dashboard Issues Panel (live crawl) ──────────────────────────────────────
+// ── Analytics report ──────────────────────────────────────────────────────────
+// A self-contained INTERACTIVE report: tab toggles, branded/non-branded keyword
+// filtering and sortable tables, in one file with no external dependencies.
+// Deliberately not a server-rendered PDF — this project sits on Vercel's Hobby plan
+// with a 12-serverless-function cap, and a headless-Chrome route would add a function
+// and blow the execution budget. Printing is handled by the browser ("Save as PDF"),
+// which keeps text vector/selectable and costs nothing per report.
+//
+// PRINT CONTRACT: panels are navigation, so print force-shows every one — you can
+// never lose a section by leaving a tab closed. The keyword segment is a data choice,
+// so print respects it and states which segment was applied.
+
+const RPT_ESC = (t: unknown) => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const RPT_NUM = (n: unknown) => (Number(n) || 0).toLocaleString();
+
+function rptDelta(v: unknown, inverted = false): string {
+  if (v === undefined || v === null || v === "") return "";
+  const n = Number(v);
+  if (!Number.isFinite(n) || n === 0) return `<span class="d flat">no change</span>`;
+  const good = inverted ? n < 0 : n > 0;
+  return `<span class="d ${good ? "up" : "down"}">${n > 0 ? "▲" : "▼"} ${Math.abs(n)}% vs prev period</span>`;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function rptChart(daily: any[], color: string, label: string): string {
+  const rows = (daily || []).filter(Boolean);
+  if (rows.length < 2) return `<p class="muted">Not enough data for a ${RPT_ESC(label)} trend.</p>`;
+  const vals = rows.map(d => Number(d.sessions ?? d.clicks ?? 0));
+  const mx = Math.max(...vals, 1), mn = Math.min(...vals);
+  const W = 640, H = 160, PAD = 28;
+  const x = (i: number) => PAD + i * ((W - PAD * 2) / (rows.length - 1));
+  const y = (v: number) => H - PAD - (v / (mx || 1)) * (H - PAD * 2);
+  const pts = vals.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const gid = `g${label.replace(/\W/g, "")}`;
+  // One hover target per point; the tooltip is a plain <title>, so it works with no JS.
+  const dots = rows.map((r, i) => `<circle cx="${x(i).toFixed(1)}" cy="${y(vals[i]).toFixed(1)}" r="7" fill="transparent" class="hit"><title>${RPT_ESC(r.date)}: ${RPT_NUM(vals[i])}</title></circle>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="${RPT_ESC(label)}">
+    <defs><linearGradient id="${gid}" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="${color}" stop-opacity="0.18"/><stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+    </linearGradient></defs>
+    <line x1="${PAD}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}" class="axis"/>
+    <polygon points="${PAD},${H - PAD} ${pts} ${x(rows.length - 1).toFixed(1)},${H - PAD}" fill="url(#${gid})"/>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>
+    <circle cx="${x(rows.length - 1).toFixed(1)}" cy="${y(vals[vals.length - 1]).toFixed(1)}" r="3.5" fill="${color}"/>
+    ${dots}
+    <text x="${PAD}" y="14" class="ct">peak ${RPT_NUM(mx)}</text>
+    <text x="${W - PAD}" y="14" class="ct" text-anchor="end">low ${RPT_NUM(mn)}</text>
+    <text x="${PAD}" y="${H - 8}" class="ct">${RPT_ESC(rows[0].date || "")}</text>
+    <text x="${W - PAD}" y="${H - 8}" class="ct" text-anchor="end">${RPT_ESC(rows[rows.length - 1].date || "")}</text>
+  </svg>`;
+}
+
+// `sort` marks a column sortable; "n" sorts on data-v numerically, "t" alphabetically.
+function rptTable(head: { l: string; sort?: "n" | "t" }[], rows: string[][], rowAttrs: string[] = []): string {
+  if (!rows.length) return "";
+  return `<table class="srt"><thead><tr>${head.map((h, i) =>
+    h.sort ? `<th data-c="${i}" data-k="${h.sort}" class="sortable" tabindex="0" role="button" aria-label="Sort by ${RPT_ESC(h.l)}">${RPT_ESC(h.l)}<span class="arw"></span></th>`
+           : `<th>${RPT_ESC(h.l)}</th>`).join("")}</tr></thead>
+  <tbody>${rows.map((r, i) => `<tr ${rowAttrs[i] || ""}>${r.map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+}
+
+// The whole report runtime. Hand-written and identical for every report — none of it
+// is derived from data, so a bad dataset can produce an empty section but never code.
+const RPT_JS = `
+(function(){
+ "use strict";
+ function $(s,r){return (r||document).querySelectorAll(s);}
+ // ── tab toggles ──
+ var tabs=$(".tab"), panels=$("[data-panel]");
+ function show(name){
+  for(var i=0;i<panels.length;i++){
+   var on = name==="all" || panels[i].getAttribute("data-panel")===name;
+   panels[i].hidden=!on;
+  }
+  for(var j=0;j<tabs.length;j++) tabs[j].setAttribute("aria-pressed", tabs[j].getAttribute("data-tab")===name?"true":"false");
+  try{ history.replaceState(null,"","#"+name); }catch(e){}
+ }
+ for(var t=0;t<tabs.length;t++)(function(b){ b.addEventListener("click",function(){ show(b.getAttribute("data-tab")); }); })(tabs[t]);
+ var start=(location.hash||"").replace("#","");
+ var valid=false; for(var v=0;v<tabs.length;v++) if(tabs[v].getAttribute("data-tab")===start) valid=true;
+ show(valid?start:"overview");
+
+ // ── keyword segment filter ──
+ var segs=$(".seg");
+ for(var s=0;s<segs.length;s++)(function(b){
+  b.addEventListener("click",function(){
+   var want=b.getAttribute("data-seg");
+   for(var k=0;k<segs.length;k++) segs[k].setAttribute("aria-pressed", segs[k]===b?"true":"false");
+   var rows=$("tr[data-brand]"), shown=0;
+   for(var r=0;r<rows.length;r++){
+    var isB=rows[r].getAttribute("data-brand")==="1";
+    var on = want==="all" || (want==="branded")===isB;
+    rows[r].hidden=!on; if(on) shown++;
+   }
+   var note=document.getElementById("segnote");
+   if(note) note.textContent = want==="all" ? "Showing all keywords" : "Showing "+shown+" "+want+" keywords";
+  });
+ })(segs[s]);
+
+ // ── sortable tables ──
+ var ths=$("th.sortable");
+ for(var h=0;h<ths.length;h++)(function(th){
+  function run(){
+   var table=th.closest("table"), body=table.tBodies[0];
+   var col=+th.getAttribute("data-c"), kind=th.getAttribute("data-k");
+   var dir=th.getAttribute("data-dir")==="asc"?"desc":"asc";
+   var peers=table.querySelectorAll("th.sortable");
+   for(var p=0;p<peers.length;p++){ peers[p].removeAttribute("data-dir"); peers[p].querySelector(".arw").textContent=""; }
+   th.setAttribute("data-dir",dir); th.querySelector(".arw").textContent = dir==="asc"?" ▲":" ▼";
+   var rows=[].slice.call(body.rows);
+   rows.sort(function(a,b){
+    var av=a.cells[col], bv=b.cells[col];
+    var ax=av?(av.getAttribute("data-v")||av.textContent):"", bx=bv?(bv.getAttribute("data-v")||bv.textContent):"";
+    if(kind==="n"){ var an=parseFloat(String(ax).replace(/[^0-9.-]/g,""))||0, bn=parseFloat(String(bx).replace(/[^0-9.-]/g,""))||0; return dir==="asc"?an-bn:bn-an; }
+    return dir==="asc"?String(ax).localeCompare(String(bx)):String(bx).localeCompare(String(ax));
+   });
+   for(var i=0;i<rows.length;i++) body.appendChild(rows[i]);
+  }
+  th.addEventListener("click",run);
+  th.addEventListener("keydown",function(e){ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); run(); } });
+ })(ths[h]);
+
+ // ── download: the page lives at about:blank, so serialise it back to a real file ──
+ var db=document.getElementById("dlbtn");
+ if(db) db.addEventListener("click",function(){
+  show("all");
+  var doc="<!DOCTYPE html>\\n"+document.documentElement.outerHTML;
+  var a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([doc],{type:"text/html"}));
+  a.download=(document.title.replace(/[^\\w.-]+/g,"-").toLowerCase()||"report")+".html";
+  a.click();
+  setTimeout(function(){ URL.revokeObjectURL(a.href); },4000);
+ });
+
+ // ── print: panels are navigation, so never let a closed tab hide a section ──
+ var pb=document.getElementById("printbtn");
+ if(pb) pb.addEventListener("click",function(){ show("all"); setTimeout(function(){ window.print(); },60); });
+ window.addEventListener("beforeprint",function(){ for(var i=0;i<panels.length;i++) panels[i].hidden=false; });
+})();
+`;
+
+// Semicircular score gauge, banded like the dashboard's (red / amber / green).
+function rptGauge(score: number): string {
+  const s = Math.max(0, Math.min(100, Number(score) || 0));
+  // Bands must match VisibilityGauge in the dashboard, or the same score prints a
+  // different colour than the screen shows.
+  const col = s >= 70 ? "#08B76C" : s >= 40 ? "#FFAB00" : "#EA1C35";
+  const frac = Math.max(0.01, Math.min(0.99, s / 100));
+  const th = Math.PI * (1 - frac);
+  const x = (70 + 60 * Math.cos(th)).toFixed(2), y = (70 - 60 * Math.sin(th)).toFixed(2);
+  return `<svg viewBox="0 0 140 84" class="gauge" role="img" aria-label="Visibility score ${s} of 100">
+    <path d="M10,70 A60,60 0 0 1 130,70" fill="none" stroke="#DFE3E5" stroke-width="12" stroke-linecap="round"/>
+    <path d="M10,70 A60,60 0 0 1 ${x},${y}" fill="none" stroke="${col}" stroke-width="12" stroke-linecap="round"/>
+    <line x1="70" y1="70" x2="${x}" y2="${y}" stroke="#292929" stroke-width="2" stroke-linecap="round" opacity="0.5"/>
+    <circle cx="70" cy="70" r="4" fill="#292929" opacity="0.7"/>
+    <text x="70" y="56" text-anchor="middle" style="font:700 26px inherit" fill="${col}">${s}</text>
+    <text x="10" y="82" style="font:9px inherit" fill="#74767C">0</text>
+    <text x="130" y="82" text-anchor="end" style="font:9px inherit" fill="#74767C">100</text>
+  </svg>`;
+}
+
+// Full AI-visibility section: gauge, real metrics, mention sources, AI-assistant
+// results and the per-question answers. Mirrors the dashboard panel field for field.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function rptAiPanel(V: any): string {
+  if (!V) return "";
+  const m = V.metrics || {};
+  const ai = V.ai_visibility || null;
+  const ch = (v: unknown) => {
+    if (v === undefined || v === null) return "";
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "";
+    return `<span class="d ${n > 0 ? "up" : n < 0 ? "down" : "flat"}">${n > 0 ? "+" : ""}${n}%</span>`;
+  };
+
+  // ── real metrics (estimated monthly) ──
+  const tiles = [
+    { l: "Brand mentions", v: RPT_NUM(m.mentions), c: ch(m.mentions_change) },
+    { l: "Web citations", v: RPT_NUM(m.citations), c: ch(m.citations_change) },
+    { l: "Cited pages", v: RPT_NUM(m.cited_pages), c: ch(m.cited_pages_change) },
+    ...(V.gsc_signal ? [{ l: "GSC branded impr", v: RPT_NUM(V.gsc_signal.branded_impressions), c: "" }] : []),
+  ];
+
+  // ── mention sources, with the same proportional bars as the dashboard ──
+  const srcs = (V.source_breakdown || V.llm_distribution || []) as { source?: string; llm?: string; pct?: number; count?: number; color?: string }[];
+  const srcHtml = srcs.length ? `<div class="srcs">${srcs.map(s => {
+    const pct = Math.max(0, Math.min(100, Number(s.pct) || 0));
+    return `<div class="src">
+      <div class="srow"><span class="sname">${RPT_ESC(s.source || s.llm || "")}</span>
+        <span class="spct">${pct}%</span><span class="scnt">${RPT_NUM(s.count)} mentions</span></div>
+      <div class="sbar"><i style="width:${pct}%;background:${RPT_ESC(s.color || "#0050EF")}"></i></div>
+    </div>`;
+  }).join("")}</div>` : "";
+
+  // ── AI assistant visibility ──
+  let aiHtml = "";
+  if (ai) {
+    const pct = Number(ai.ai_visibility_pct) || 0;
+    const tone = pct >= 40 ? "p1" : pct > 0 ? "p3" : "p4";
+    const stats = [
+      { l: "AI mention rate", v: `${pct}%` },
+      { l: "Share of voice", v: ai.share_of_voice != null ? `${ai.share_of_voice}%` : "—" },
+      { l: "Avg rank in answers", v: ai.avg_rank != null ? `#${ai.avg_rank}` : "—" },
+    ];
+    const plats = (ai.platforms || []) as { platform: string; rate: number }[];
+    const comps = (ai.competitors || []).slice(0, 10) as { name: string; mentions: number }[];
+    const results = (ai.results || []) as { question: string; answer: string; brands_mentioned?: string[]; your_brand_mentioned?: boolean; your_rank?: number | null }[];
+
+    aiHtml = `<div class="aiblk">
+      <div class="aihead">
+        <h3 style="margin:0">AI assistant visibility${ai.engine ? `<span class="eng">${RPT_ESC(ai.engine)}</span>` : ""}</h3>
+        <span class="pill ${tone}">Mentioned in ${RPT_NUM(ai.mentioned_count)}/${RPT_NUM(ai.total_questions)} AI answers</span>
+      </div>
+      ${ai.category ? `<p class="muted">Category tested: <strong>${RPT_ESC(ai.category)}</strong></p>` : ""}
+      <div class="grid g3">${stats.map(s => `<div class="kpi"><p class="l">${RPT_ESC(s.l)}</p><p class="v">${RPT_ESC(s.v)}</p></div>`).join("")}</div>
+      ${plats.length ? `<div class="chips">${plats.map(p => `<span class="chip">${RPT_ESC(p.platform)} <b>${Number(p.rate) || 0}%</b></span>`).join("")}
+        ${ai.overall_rate != null && plats.length > 1 ? `<span class="chip on">Overall <b>${ai.overall_rate}%</b></span>` : ""}</div>` : ""}
+      ${comps.length ? `<h4>Who the AI recommends most (your competitors)</h4>
+        <div class="chips">${comps.map(c => `<span class="chip">${RPT_ESC(c.name)} <b>&times;${Number(c.mentions) || 0}</b></span>`).join("")}</div>` : ""}
+      ${results.length ? `<h4>The questions we asked</h4>${results.map(r => `
+        <div class="qa ${r.your_brand_mentioned ? "hit" : "miss"}">
+          <p class="q"><span class="mk">${r.your_brand_mentioned ? "✓" : "✗"}</span>${RPT_ESC(r.question)}${r.your_rank != null ? ` <span class="pill p2">ranked #${r.your_rank}</span>` : ""}</p>
+          <p class="ans">${RPT_ESC(r.answer)}</p>
+          ${(r.brands_mentioned || []).length ? `<div class="chips">${(r.brands_mentioned || []).map(b => `<span class="chip sm">${RPT_ESC(b)}</span>`).join("")}</div>` : ""}
+        </div>`).join("")}` : ""}
+    </div>`;
+  }
+
+  return `${V.visibility_score != null ? `<div class="gaugerow">${rptGauge(V.visibility_score)}
+      <div><p class="glabel">${RPT_ESC(V.label || "")}</p><p class="muted" style="margin:2px 0 0">${RPT_ESC(V.description || "")}</p></div>
+    </div>` : ""}
+    ${tiles.length ? `<h4>Real metrics (est. monthly)</h4><div class="grid g4">${tiles.map(t =>
+      `<div class="kpi"><p class="l">${RPT_ESC(t.l)}</p><p class="v">${RPT_ESC(t.v)}</p>${t.c}</div>`).join("")}</div>` : ""}
+    ${srcHtml ? `<h4>Mention sources</h4>${srcHtml}` : ""}
+    ${aiHtml}`;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function buildDashboardReport(o: { domain: string; rangeLabel: string; prevLabel: string; gsc: any; ga4: any; vis: any }): string {
+  const { domain, rangeLabel, prevLabel, gsc, ga4, vis } = o;
+  const g = gsc?.summary || null, a = ga4?.summary || null;
+  const generated = new Date().toLocaleString(undefined, { dateStyle: "long", timeStyle: "short" });
+  // Brand token from the domain, used to split branded vs non-branded queries.
+  const brandTok = String(domain || "").replace(/^www\./, "").split(".")[0].toLowerCase();
+  const isBrand = (q: string) => !!brandTok && q.toLowerCase().includes(brandTok);
+
+  const kpis: { label: string; value: string; sub?: string; change?: unknown; inv?: boolean }[] = [
+    { label: "Organic clicks", value: g ? RPT_NUM(g.clicks) : "—", change: g?.clicks_change },
+    { label: "Sessions", value: a ? RPT_NUM(a.sessions) : "—", change: a?.sessions_change },
+    { label: "Avg position", value: g ? `#${Number(g.pos).toFixed(1)}` : "—", change: g?.pos_change, inv: true },
+    { label: "Impressions", value: g ? RPT_NUM(g.impressions) : "—", change: g?.impressions_change },
+    { label: "Users", value: a ? RPT_NUM(a.users) : "—", change: a?.users_change },
+    { label: "Bounce rate", value: a ? `${a.bounce_rate}%` : "—", change: a?.bounce_change, inv: true },
+    { label: "Avg CTR", value: g ? `${Number(g.ctr).toFixed(1)}%` : "—", change: g?.ctr_change },
+  ];
+
+  const queries = (gsc?.queries || []) as { query: string; clicks: number; impressions: number; ctr: number; pos: number }[];
+  const buckets = [
+    { l: "Positions 1-3", n: queries.filter(q => q.pos <= 3).length, c: "p1" },
+    { l: "Positions 4-10", n: queries.filter(q => q.pos > 3 && q.pos <= 10).length, c: "p2" },
+    { l: "Positions 11-20", n: queries.filter(q => q.pos > 10 && q.pos <= 20).length, c: "p3" },
+    { l: "Beyond 20", n: queries.filter(q => q.pos > 20).length, c: "p4" },
+  ];
+  const posPill = (p: number) => `<span class="pill ${p <= 3 ? "p1" : p <= 10 ? "p2" : p <= 20 ? "p3" : "p4"}">${Number(p).toFixed(1)}</span>`;
+  const topKw = [...queries].sort((x, y) => y.clicks - x.clicks).slice(0, 30);
+
+  const avgCtr = g ? Number(g.ctr) : 0;
+  const gaps = queries.filter(q => q.impressions >= 100 && q.ctr < avgCtr && q.pos <= 30).sort((x, y) => y.impressions - x.impressions).slice(0, 12);
+  const wins = queries.filter(q => q.pos > 10 && q.pos <= 30 && q.impressions >= 50).sort((x, y) => y.impressions - x.impressions).slice(0, 12);
+
+  // The AI tab appears when there is a score, real metrics, sources, or assistant results.
+  const hasAi = !!(vis && (vis.visibility_score != null || vis.metrics || (vis.source_breakdown || vis.llm_distribution || []).length || vis.ai_visibility));
+
+  const TABS = [
+    ["overview", "Overview"], ["trends", "Trends"], ["keywords", "Keywords"],
+    ["gaps", "Content Gaps"], ["ai", "AI Visibility"], ["all", "Show all"],
+  ].filter(([id]) =>
+    id === "overview" || id === "all" ||
+    (id === "trends" && (ga4?.daily?.length || gsc?.daily?.length)) ||
+    (id === "keywords" && queries.length) ||
+    (id === "gaps" && (gaps.length || wins.length)) ||
+    (id === "ai" && hasAi));
+
+  const panel = (id: string, title: string, note: string, inner: string) =>
+    `<section data-panel="${id}" class="blk" hidden><h2>${RPT_ESC(title)}</h2>${note ? `<p class="muted">${note}</p>` : ""}${inner}</section>`;
+
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Analytics Report — ${RPT_ESC(domain)}</title>
+<style>
+  @page { size: A4; margin: 13mm 11mm; }
+  *{box-sizing:border-box}
+  body{margin:0;font:13px/1.55 Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;color:#292929;background:#F5F5F5}
+  .sheet{max-width:860px;margin:0 auto;padding:20px;background:#fff;min-height:100vh}
+  header.rpt{border-bottom:3px solid #0050EF;padding-bottom:14px;margin-bottom:14px}
+  h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em}
+  h2{font-size:15px;margin:0 0 4px;letter-spacing:-.01em;padding-bottom:6px;border-bottom:1px solid #DFE3E5}
+  h3{font-size:12px;margin:18px 0 0}
+  .site{display:inline-block;font-size:12px;font-weight:700;color:#0038AA;background:#E6F2FF;border-radius:20px;padding:2px 10px}
+  .meta{font-size:11px;color:#74767C;margin:6px 0 0}
+  .muted{font-size:11px;color:#74767C;margin:4px 0 10px}
+  .blk{margin:0 0 22px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  @media(max-width:720px){.grid{grid-template-columns:repeat(2,1fr)}.charts{grid-template-columns:1fr!important}}
+  .kpi{border:1px solid #DFE3E5;border-radius:8px;padding:10px 12px;break-inside:avoid}
+  .kpi .l{font-size:9.5px;font-weight:700;color:#74767C;text-transform:uppercase;letter-spacing:.06em;margin:0 0 4px}
+  .kpi .v{font-size:20px;font-weight:700;margin:0;letter-spacing:-.02em}
+  .kpi .s{font-size:10px;color:#74767C;margin:2px 0 0}
+  .d{font-size:10px;font-weight:600;display:block;margin-top:3px}
+  .d.up{color:#08B76C}.d.down{color:#EA1C35}.d.flat{color:#74767C}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .chart{width:100%;height:auto;border:1px solid #DFE3E5;border-radius:8px;background:#fff}
+  .axis{stroke:#DFE3E5;stroke-width:1}
+  .ct{font-size:9px;fill:#74767C;font-family:inherit}
+  .hit{cursor:crosshair}
+  table{width:100%;border-collapse:collapse;font-size:11.5px;margin:8px 0 0}
+  th{text-align:left;font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;color:#74767C;background:#F5F5F5;padding:6px 8px;border-bottom:1px solid #DFE3E5;white-space:nowrap}
+  th.sortable{cursor:pointer;user-select:none}
+  th.sortable:hover{color:#0038AA;background:#E6F2FF}
+  th.sortable:focus-visible{outline:2px solid #0050EF;outline-offset:-2px}
+  .arw{font-size:8px;color:#0050EF}
+  td{padding:6px 8px;border-bottom:1px solid #F5F5F5;vertical-align:top}
+  td:first-child{font-weight:600;max-width:300px;word-break:break-word}
+  tbody tr:nth-child(even){background:#FFFFFF}
+  tr[hidden]{display:none}
+  .pill{display:inline-block;font-size:10px;font-weight:700;border-radius:4px;padding:1px 7px}
+  .p1{background:#ecfdf5;color:#065f46}.p2{background:#E6F2FF;color:#0038AA}.p3{background:#fffbeb;color:#92400e}.p4{background:#fef2f2;color:#991b1b}
+  .score{font-size:34px;font-weight:700;color:#0050EF;letter-spacing:-.03em;margin:0}
+  h4{font-size:10px;font-weight:700;color:#74767C;text-transform:uppercase;letter-spacing:.06em;margin:20px 0 8px}
+  .g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}
+  @media(max-width:720px){.g3,.g4{grid-template-columns:repeat(2,1fr)}}
+  .gaugerow{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin:6px 0 4px}
+  .gauge{width:150px;height:90px;flex:none}
+  .glabel{font-size:14px;font-weight:700;margin:0;text-transform:capitalize}
+  .srcs{display:grid;gap:9px}
+  .src .srow{display:flex;align-items:baseline;gap:8px;font-size:11.5px}
+  .sname{font-weight:600;flex:1}
+  .spct{font-weight:700;color:#0038AA}
+  .scnt{color:#74767C;font-size:10.5px}
+  .sbar{height:5px;background:#F5F5F5;border-radius:99px;overflow:hidden;margin-top:3px}
+  .sbar i{display:block;height:100%;border-radius:99px}
+  .aiblk{margin-top:8px;padding-top:14px;border-top:1px solid #DFE3E5}
+  .aihead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .eng{margin-left:7px;font-size:9px;font-weight:700;color:#fff;background:#0050EF;padding:1px 7px;border-radius:4px;vertical-align:middle}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0}
+  .chip{font-size:10.5px;font-weight:600;color:#334155;background:#fff;border:1px solid #DFE3E5;border-radius:999px;padding:3px 10px}
+  .chip b{color:#0038AA}
+  .chip.on{background:#E6F2FF;border-color:#CCE6FF;color:#0038AA}
+  .chip.sm{font-size:10px;color:#0038AA;background:#E6F2FF;border-color:#CCE6FF;border-radius:4px;padding:2px 7px}
+  .qa{border:1px solid #DFE3E5;border-left-width:3px;border-radius:8px;padding:10px 12px;margin:8px 0 0;break-inside:avoid}
+  .qa.hit{border-left-color:#08B76C}.qa.miss{border-left-color:#EA1C35}
+  .qa .q{font-size:12px;font-weight:700;margin:0 0 5px}
+  .qa .mk{display:inline-block;width:15px;font-weight:700}
+  .qa.hit .mk{color:#08B76C}.qa.miss .mk{color:#EA1C35}
+  .qa .ans{font-size:11px;color:#475569;margin:0;line-height:1.5}
+  .nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 18px;padding:10px 0;border-bottom:1px solid #DFE3E5;position:sticky;top:0;background:#fff;z-index:5}
+  .tab,.seg{font:inherit;font-size:12px;font-weight:600;padding:6px 13px;border:1px solid #DFE3E5;border-radius:999px;background:#fff;color:#74767C;cursor:pointer}
+  .tab:hover,.seg:hover{border-color:#0050EF;color:#0038AA}
+  .tab[aria-pressed="true"],.seg[aria-pressed="true"]{background:#0050EF;border-color:#0050EF;color:#fff}
+  .seg{font-size:11px;padding:4px 11px}
+  .segbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:10px 0 0}
+  #printbtn{margin-left:auto;background:linear-gradient(135deg,#0050EF,#095CFF);border-color:#0050EF;color:#fff}
+  footer.rpt{margin-top:26px;padding-top:10px;border-top:1px solid #DFE3E5;font-size:10px;color:#74767C}
+  @media print{
+    body{background:#fff;font-size:11px}
+    .sheet{padding:0;max-width:none}
+    .nav,#printbtn{display:none!important}
+    /* Panels are NAVIGATION: force every one visible so a closed tab can never drop a
+       section from the printed report. Row-level segment filters are a data choice and
+       are intentionally left alone. */
+    [data-panel]{display:block!important}
+    .blk{break-inside:avoid}
+    a{text-decoration:none;color:inherit}
+  }
+</style>
+<!-- Panels are hidden by default and revealed by the runtime. Without JS that would be a
+     blank page, so fall back to showing everything as one long document. -->
+<noscript><style>[data-panel]{display:block!important}.nav{display:none}</style></noscript>
+</head>
+<body><div class="sheet">
+
+<header class="rpt">
+  <h1>Analytics Report</h1>
+  <span class="site">${RPT_ESC(domain || "—")}</span>
+  <p class="meta">Reporting period <strong>${RPT_ESC(rangeLabel)}</strong>${prevLabel ? ` &middot; deltas compare the previous equal period (<strong>${RPT_ESC(prevLabel)}</strong>)` : ""}</p>
+  <p class="meta">Generated ${RPT_ESC(generated)}${!gsc ? " &middot; Search Console not connected" : ""}${!ga4 ? " &middot; GA4 not connected" : ""}</p>
+</header>
+
+<nav class="nav">
+  ${TABS.map(([id, l]) => `<button class="tab" type="button" data-tab="${id}" aria-pressed="false">${RPT_ESC(l)}</button>`).join("")}
+  <button id="dlbtn" class="tab" type="button" title="Save this report as a single HTML file you can email or attach">↓ Download</button>
+  <button id="printbtn" class="tab" type="button">↓ Save as PDF</button>
+</nav>
+
+${panel("overview", "Performance summary", "", `<div class="grid">
+  ${kpis.map(k => `<div class="kpi"><p class="l">${RPT_ESC(k.label)}</p><p class="v">${RPT_ESC(k.value)}</p>${k.sub ? `<p class="s">${RPT_ESC(k.sub)}</p>` : ""}${rptDelta(k.change, k.inv)}</div>`).join("")}
+</div>`)}
+
+${(ga4?.daily?.length || gsc?.daily?.length) ? panel("trends", "Trends", "Hover any point for its date and value.", `<div class="charts">
+  ${ga4?.daily?.length ? `<div><p class="muted">Daily sessions</p>${rptChart(ga4.daily, "#08B76C", "Sessions")}</div>` : ""}
+  ${gsc?.daily?.length ? `<div><p class="muted">Daily organic clicks</p>${rptChart(gsc.daily, "#0050EF", "Clicks")}</div>` : ""}
+</div>`) : ""}
+
+${queries.length ? panel("keywords", "Keyword rankings", `${queries.length} keywords tracked from Search Console. Click any column heading to sort.`,
+  rptTable([{ l: "Position band" }, { l: "Keywords" }], buckets.map(b => [`<span class="pill ${b.c}">${RPT_ESC(b.l)}</span>`, `<strong>${b.n}</strong>`])) +
+  `<h3>Top keywords by clicks</h3>
+   <div class="segbar"><span class="muted" style="margin:0">Segment:</span>
+     <button class="seg" type="button" data-seg="all" aria-pressed="true">All</button>
+     <button class="seg" type="button" data-seg="branded" aria-pressed="false">Branded</button>
+     <button class="seg" type="button" data-seg="nonbranded" aria-pressed="false">Non-branded</button>
+     <span class="muted" id="segnote" style="margin:0">Showing all keywords</span>
+   </div>` +
+  rptTable(
+    [{ l: "Keyword", sort: "t" }, { l: "Clicks", sort: "n" }, { l: "Impressions", sort: "n" }, { l: "CTR", sort: "n" }, { l: "Position", sort: "n" }],
+    topKw.map(q => [RPT_ESC(q.query), RPT_NUM(q.clicks), RPT_NUM(q.impressions), `${Number(q.ctr).toFixed(1)}%`, posPill(q.pos)]),
+    topKw.map(q => `data-brand="${isBrand(q.query) ? 1 : 0}"`))) : ""}
+
+${(gaps.length || wins.length) ? panel("gaps", "Content gaps &amp; quick wins",
+  `Average CTR for the period is <strong>${avgCtr.toFixed(1)}%</strong>. Sortable.`,
+  (gaps.length ? `<h3>High impressions, below-average CTR</h3><p class="muted">These rank but under-earn clicks; rewriting the title and meta description is the usual fix.</p>` +
+    rptTable([{ l: "Keyword", sort: "t" }, { l: "Impressions", sort: "n" }, { l: "CTR", sort: "n" }, { l: "Position", sort: "n" }],
+      gaps.map(q => [RPT_ESC(q.query), RPT_NUM(q.impressions), `<span class="pill p4">${Number(q.ctr).toFixed(1)}%</span>`, posPill(q.pos)])) : "") +
+  (wins.length ? `<h3>Quick wins — page 2 and 3</h3><p class="muted">Already ranking 11-30 with real impression volume. Small on-page gains move these onto page one.</p>` +
+    rptTable([{ l: "Keyword", sort: "t" }, { l: "Impressions", sort: "n" }, { l: "Position", sort: "n" }, { l: "Clicks", sort: "n" }],
+      wins.map(q => [RPT_ESC(q.query), RPT_NUM(q.impressions), posPill(q.pos), RPT_NUM(q.clicks)])) : "")) : ""}
+
+${hasAi ? panel("ai", "AI search visibility", "Real brand mentions from Google News, Reddit and web, plus how often live AI assistants name you.", rptAiPanel(vis)) : ""}
+
+<footer class="rpt">RankMind &middot; ${RPT_ESC(domain || "")} &middot; ${RPT_ESC(rangeLabel)} &middot; generated ${RPT_ESC(generated)}</footer>
+</div>
+<script>${RPT_JS}<\/script>
+</body></html>`;
+}
+
+// Open in a new tab. Popup blockers are the one real failure mode, so fall back to a
+// download of the same self-contained file.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function openDashboardReport(o: { domain: string; rangeLabel: string; prevLabel: string; gsc: any; ga4: any; vis: any }) {
+  const html = buildDashboardReport(o);
+  const w = window.open("", "_blank");
+  if (w && w.document) { w.document.open(); w.document.write(html); w.document.close(); return true; }
+  const a = document.createElement("a");
+  a.href = "data:text/html;charset=utf-8," + encodeURIComponent(html);
+  a.download = `analytics-report-${(o.domain || "site").replace(/[^\w.-]/g, "")}.html`;
+  a.click();
+  return false;
+}
+
+// ── Tracked keywords ──────────────────────────────────────────────────────────
+// A watchlist the user types in themselves, resolved against Search Console data for
+// the selected range and joined to the SAME keyword in the previous equal period.
+// Stored per domain so switching projects shows that project's list.
+//
+// Position deltas are INVERTED: moving from #12 to #4 is -8 and is an improvement.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function TrackedKeywords({domain, gsc, rangeLabel, prevLabel}:{domain:string; gsc:any; rangeLabel:string; prevLabel:string}) {
+  // The key is normalised (lowercase, no scheme/www/trailing slash) because the selected
+  // domain string can differ between machines — "compunnel.com" on one, "www.compunnel.com"
+  // on another — which silently pointed at a different, empty list.
+  const normKey = (d:string) => `rm_tracked_kw_${String(d||"_").replace(/^https?:\/\//,"").replace(/^www\./,"").replace(/\/$/,"").toLowerCase()||"_"}`;
+  const key = normKey(domain);
+  const [list,setListRaw] = useState<string[]>([]);
+  const [draft,setDraft] = useState("");
+  const [sortKey,setSortKey] = useState<"added"|"pos"|"change">("added");
+  // Lists stored under OTHER domains, so a list that exists but is filed elsewhere is
+  // reported rather than appearing as "you have no keywords".
+  const [elsewhere,setElsewhere] = useState<{k:string;d:string;n:number}[]>([]);
+
+  // Re-read when the project changes — this card is reused across domains.
+  useEffect(()=>{
+    try{
+      let raw = localStorage.getItem(key);
+      // Migrate any legacy un-normalised key for this same domain (e.g. with www/scheme).
+      if(!raw){
+        for(let i=0;i<localStorage.length;i++){
+          const k=localStorage.key(i);
+          if(!k||!k.startsWith("rm_tracked_kw_")||k===key) continue;
+          if(normKey(k.slice("rm_tracked_kw_".length))===key){
+            raw=localStorage.getItem(k);
+            if(raw){ localStorage.setItem(key,raw); localStorage.removeItem(k); }
+            break;
+          }
+        }
+      }
+      const parsed:string[] = raw?JSON.parse(raw):[];
+      const seen = new Set<string>();
+      const deduped = parsed.filter(k=>{ const lc=String(k).toLowerCase().trim(); if(!lc||seen.has(lc)) return false; seen.add(lc); return true; });
+      if(deduped.length<parsed.length) try{ localStorage.setItem(key, JSON.stringify(deduped)); }catch{}
+      setListRaw(deduped);
+      // Index every other domain that has a saved list.
+      const others:{k:string;d:string;n:number}[]=[];
+      for(let i=0;i<localStorage.length;i++){
+        const k=localStorage.key(i);
+        if(!k||!k.startsWith("rm_tracked_kw_")||k===key) continue;
+        try{ const arr=JSON.parse(localStorage.getItem(k)||"[]"); if(Array.isArray(arr)&&arr.length) others.push({k,d:k.slice("rm_tracked_kw_".length),n:arr.length}); }catch{}
+      }
+      setElsewhere(others);
+    }
+    catch{ setListRaw([]); }
+  },[key]);
+
+  const setList = (next:string[]) => {
+    setListRaw(next);
+    try{ localStorage.setItem(key, JSON.stringify(next)); }catch{}
+  };
+  const add = () => {
+    const incoming = draft.split(/[\n,]+/).map(k=>k.trim().toLowerCase()).filter(Boolean);
+    if(!incoming.length) return;
+    const merged = [...list];
+    incoming.forEach(k=>{ if(!merged.some(x=>x.toLowerCase()===k)) merged.push(k); });
+    setList(merged.slice(0,200));
+    setDraft("");
+  };
+  const remove = (kw:string) => setList(list.filter(x=>x!==kw));
+
+  // ── Resolve each tracked keyword against current + previous period ──
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cur = new Map<string,any>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ((gsc?.queries)||[]).forEach((q:any)=>cur.set(String(q.query).toLowerCase(),q));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const gone = new Map<string,any>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ((gsc?.prev_only)||[]).forEach((q:any)=>gone.set(String(q.query).toLowerCase(),q));
+  const hasPrev = Array.isArray(gsc?.prev_only) || ((gsc?.queries)||[]).some((q:{prev_pos?:number|null})=>q.prev_pos!=null);
+
+  const rows = list.map(kw=>{
+    const k = kw.toLowerCase();
+    const c = cur.get(k);
+    const p = gone.get(k);
+    if(c) return {
+      kw, found:true, pos:c.pos as number, prev:(c.prev_pos ?? null) as number|null,
+      clicks:c.clicks as number, impressions:c.impressions as number, ctr:c.ctr as number,
+      prevClicks:(c.prev_clicks ?? null) as number|null, dropped:false,
+    };
+    if(p) return {
+      // Ranked last period, no impressions this one.
+      kw, found:false, pos:null as number|null, prev:p.pos as number,
+      clicks:0, impressions:0, ctr:0, prevClicks:p.clicks as number, dropped:true,
+    };
+    return { kw, found:false, pos:null as number|null, prev:null as number|null,
+      clicks:0, impressions:0, ctr:0, prevClicks:null as number|null, dropped:false };
+  });
+
+  const delta = (r:typeof rows[number]) => (r.pos!=null && r.prev!=null) ? +(r.pos-r.prev).toFixed(1) : null;
+  const sorted = [...rows].sort((a,b)=>{
+    if(sortKey==="pos") return (a.pos??999)-(b.pos??999);
+    if(sortKey==="change"){ const da=delta(a), db=delta(b); return (da??999)-(db??999); }
+    return 0;
+  });
+
+  const improved = rows.filter(r=>{const d=delta(r); return d!=null&&d<0;}).length;
+  const declined = rows.filter(r=>{const d=delta(r); return d!=null&&d>0;}).length;
+  const notRanking = rows.filter(r=>r.pos==null).length;
+
+  const TH2 = ({children,onClick,active}:{children:React.ReactNode;onClick?:()=>void;active?:boolean}) => (
+    <th onClick={onClick} style={{padding:"9px 12px",textAlign:"left",fontSize:10,fontWeight:700,color:active?S.accent:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.05em",borderBottom:`1px solid ${S.border}`,background:"#f8fafc",whiteSpace:"nowrap" as const,cursor:onClick?"pointer":"default",userSelect:"none" as const}}>{children}</th>
+  );
+
+  return (
+    <Card id="sec-tracked" style={{marginBottom:20,scrollMarginTop:64}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap" as const,gap:8}}>
+        <div>
+          <p style={{fontSize:13,fontWeight:700,color:S.text,margin:"0 0 2px"}}>Tracked keywords</p>
+          <p style={{fontSize:11,color:S.muted,margin:0}}>
+            Your own watchlist for <strong>{domain||"this site"}</strong> — position in {rangeLabel.toLowerCase()}{prevLabel?<> vs <strong>{prevLabel}</strong></>:null}.
+          </p>
+        </div>
+        {rows.length>0&&(
+          <button onClick={()=>downloadCSV(`tracked-keywords-${domain||"site"}.csv`,
+            ["Keyword","Position","Prev position","Change","Clicks","Impressions","CTR %"],
+            sorted.map(r=>[r.kw, r.pos??"Not ranking", r.prev??"—", delta(r)??"—", r.clicks, r.impressions, r.ctr]))}
+            style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ Export CSV</button>
+        )}
+      </div>
+
+      <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap" as const}}>
+        <div style={{flex:1,minWidth:260}}>
+          <TI value={draft} onChange={setDraft} placeholder="Add keywords — one per line or comma separated"/>
+        </div>
+        <Btn small onClick={add} disabled={!draft.trim()}>+ Track</Btn>
+      </div>
+
+      {rows.length===0 ? (
+        <p style={{fontSize:12,color:S.muted,margin:0}}>
+          No tracked keywords for <strong>{domain||"this site"}</strong> yet. Add the terms you care about and they&apos;ll be matched against Search Console each time the range changes.
+          {elsewhere.length>0 && (
+            <><br/><span style={{color:S.amberText}}>You do have lists saved under: {elsewhere.map(e=>`${e.d} (${e.n})`).join(", ")} — switch project to see them.</span></>
+          )}
+        </p>
+      ) : (
+        <>
+          <div style={{display:"flex",gap:8,flexWrap:"wrap" as const,marginBottom:12}}>
+            {[
+              {l:"Tracked",v:rows.length,c:S.accent},
+              {l:"Improved",v:improved,c:S.green},
+              {l:"Declined",v:declined,c:S.red},
+              {l:"Not ranking",v:notRanking,c:S.muted},
+            ].map(m=>(
+              <div key={m.l} style={{padding:"6px 12px",borderRadius:8,background:S.subtle,border:`1px solid ${S.border}`}}>
+                <span style={{fontSize:11,color:S.muted}}>{m.l}: </span>
+                <span style={{fontSize:13,fontWeight:700,color:m.c}}>{m.v}</span>
+              </div>
+            ))}
+          </div>
+
+          {!hasPrev&&(
+            <p style={{fontSize:11,color:S.amberText,background:S.amberBg,border:"1px solid #fde68a",borderRadius:6,padding:"6px 10px",margin:"0 0 10px"}}>
+              ⚠ No previous-period keyword data in this cached Search Console pull. Re-sync GSC to populate the comparison columns.
+            </p>
+          )}
+
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:640}}>
+              <thead><tr>
+                <TH2>Keyword</TH2>
+                <TH2 onClick={()=>setSortKey("pos")} active={sortKey==="pos"}>Position</TH2>
+                <TH2>Previous</TH2>
+                <TH2 onClick={()=>setSortKey("change")} active={sortKey==="change"}>Change</TH2>
+                <TH2>Clicks</TH2>
+                <TH2>Impressions</TH2>
+                <TH2>CTR</TH2>
+                <TH2>{""}</TH2>
+              </tr></thead>
+              <tbody>{sorted.map((r,i)=>{
+                const d = delta(r);
+                // Lower position number is better, so a negative delta is the good direction.
+                const good = d!=null && d<0;
+                return (
+                  <tr key={i}>
+                    <TD bold>{r.kw}</TD>
+                    <TD>{r.pos!=null
+                      ? <span style={{fontSize:11,fontWeight:700,color:r.pos<=3?S.green:r.pos<=10?S.accent:r.pos<=20?S.amber:S.red,background:r.pos<=3?S.greenBg:r.pos<=10?S.accentBg:r.pos<=20?S.amberBg:S.redBg,padding:"2px 8px",borderRadius:4}}>#{r.pos}</span>
+                      : <span style={{fontSize:11,fontWeight:600,color:S.red,background:S.redBg,padding:"2px 8px",borderRadius:4}}>Not ranking</span>}</TD>
+                    <TD color={S.muted}>{r.prev!=null?`#${r.prev}`:"—"}</TD>
+                    <TD>{d!=null
+                      ? <span style={{fontSize:12,fontWeight:700,color:good?S.green:d===0?S.muted:S.red}}>{d===0?"no change":`${good?"▲":"▼"} ${Math.abs(d)}`}</span>
+                      : r.dropped
+                        ? <span style={{fontSize:11,fontWeight:700,color:S.red}}>▼ dropped out</span>
+                        : r.prev==null&&r.pos!=null
+                          ? <span style={{fontSize:11,fontWeight:700,color:S.green}}>new</span>
+                          : <span style={{fontSize:11,color:S.muted}}>—</span>}</TD>
+                    <TD color={S.muted}>{r.clicks.toLocaleString()}</TD>
+                    <TD color={S.muted}>{r.impressions.toLocaleString()}</TD>
+                    <TD color={S.muted}>{r.ctr?`${r.ctr}%`:"—"}</TD>
+                    <TD><button onClick={()=>remove(r.kw)} title="Stop tracking" style={{fontSize:13,color:S.muted,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0,lineHeight:1}}>✕</button></TD>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+// ── Zoho CRM pipeline ─────────────────────────────────────────────────────────
+// Closes the loop between rankings and revenue: Search Console says what ranks, Zoho says
+// what it was worth. Renders nothing until the credentials are present, so an unconfigured
+// install shows a short setup note rather than an empty widget.
+function ZohoPipeline() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [d,setD] = useState<any>(null);
+  const [loading,setLoading] = useState(false);
+  const [err,setErr] = useState("");
+  const [days,setDays] = useState("90");
+
+  const load = async (range=days) => {
+    setLoading(true); setErr("");
+    try{
+      const r = await fetch(`/api/tools?tool=zoho&days=${range}`);
+      const j = await r.json();
+      if(j.error && !j.configured) { setD(j); }            // not connected — show setup help
+      else if(j.error) throw new Error(j.error);
+      else setD(j);
+    }catch(e){ setErr(e instanceof Error?e.message:"Could not reach Zoho"); }
+    finally{ setLoading(false); }
+  };
+  useEffect(()=>{ load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ },[]);
+
+  const money = (n:number) => n>=1000000 ? `${(n/1000000).toFixed(1)}M` : n>=1000 ? `${(n/1000).toFixed(1)}k` : String(n||0);
+
+  return (
+    <Card id="sec-crm" style={{marginBottom:20,scrollMarginTop:64}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap" as const,gap:8}}>
+        <div>
+          <p style={{fontSize:13,fontWeight:700,color:S.text,margin:"0 0 2px"}}>CRM pipeline · Zoho</p>
+          <p style={{fontSize:11,color:S.muted,margin:0}}>Leads and deals by source — what organic search actually produced.</p>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <select value={days} onChange={e=>{setDays(e.target.value);load(e.target.value);}}
+            style={{fontSize:12,padding:"5px 8px",border:`1px solid ${S.border}`,borderRadius:6,background:"#fff",color:S.text,fontFamily:"inherit"}}>
+            {["30","90","180","365"].map(n=><option key={n} value={n}>Last {n} days</option>)}
+          </select>
+          <Btn small variant="secondary" onClick={()=>load()} disabled={loading}>{loading?"Loading…":"Refresh"}</Btn>
+        </div>
+      </div>
+
+      {err && <p style={{fontSize:12,color:S.red,margin:"0 0 10px"}}>⚠ {err}</p>}
+
+      {d && d.configured===false && (
+        <div style={{fontSize:12,color:S.muted,lineHeight:1.6}}>
+          <p style={{margin:"0 0 8px"}}>Zoho is not connected yet. Create a <strong>Self Client</strong> in the Zoho API console, generate a grant token with scope <code style={{background:S.subtle,padding:"1px 5px",borderRadius:4}}>ZohoCRM.modules.READ</code>, exchange it once for a refresh token, then set in Vercel:</p>
+          <pre style={{fontSize:11,background:S.subtle,border:`1px solid ${S.border}`,borderRadius:6,padding:"8px 10px",margin:"0 0 8px",overflowX:"auto" as const}}>{`ZOHO_CLIENT_ID
+ZOHO_CLIENT_SECRET
+ZOHO_REFRESH_TOKEN
+ZOHO_DC      # us | eu | in | au | jp | ca  (default us)`}</pre>
+          <p style={{margin:0}}>ZOHO_DC must match the data centre the account lives in, or every call fails with an invalid-token error.</p>
+        </div>
+      )}
+
+      {d && d.configured && (
+        <>
+          <div style={{display:"flex",gap:10,flexWrap:"wrap" as const,marginBottom:14}}>
+            {[
+              {l:"Leads",v:(d.leads?.total||0).toLocaleString(),s:`${d.leads?.organic||0} organic`,c:S.accent},
+              {l:"Open deals",v:(d.deals?.open||0).toLocaleString(),s:`${money(d.deals?.pipeline_value||0)} pipeline`,c:S.text},
+              {l:"Won",v:(d.deals?.won||0).toLocaleString(),s:`${money(d.deals?.won_value||0)} value`,c:S.green},
+              {l:"Won from organic",v:money(d.deals?.organic_won_value||0),s:`${d.deals?.organic_count||0} deals sourced`,c:S.green},
+            ].map(m=>(
+              <div key={m.l} style={{flex:1,minWidth:150,border:`1px solid ${S.border}`,borderRadius:8,padding:"10px 12px"}}>
+                <p style={{fontSize:10,fontWeight:700,color:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.06em",margin:"0 0 4px"}}>{m.l}</p>
+                <p style={{fontSize:20,fontWeight:700,color:m.c,margin:0}}>{m.v}</p>
+                <p style={{fontSize:10,color:S.muted,margin:"2px 0 0"}}>{m.s}</p>
+              </div>
+            ))}
+          </div>
+
+          {(d.leads?.by_source||[]).length>0 && (
+            <>
+              <p style={{fontSize:11,fontWeight:700,color:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.05em",margin:"0 0 6px"}}>Leads by source</p>
+              <div style={{overflowX:"auto",marginBottom:14}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:420}}>
+                  <thead><tr><TH>Source</TH><TH>Leads</TH><TH>Share</TH></tr></thead>
+                  <tbody>{(d.leads.by_source||[]).map((r:{source:string;count:number;organic:boolean},i:number)=>{
+                    const pct = d.leads.total ? Math.round((r.count/d.leads.total)*100) : 0;
+                    return (
+                      <tr key={i}>
+                        <TD bold>{r.source}{r.organic&&<span style={{marginLeft:6,fontSize:10,fontWeight:700,color:S.greenText,background:S.greenBg,padding:"1px 6px",borderRadius:4}}>organic</span>}</TD>
+                        <TD color={S.muted}>{r.count.toLocaleString()}</TD>
+                        <TD>
+                          <div style={{display:"flex",alignItems:"center",gap:8}}>
+                            <div style={{width:70,height:5,background:S.subtle,borderRadius:99,overflow:"hidden"}}>
+                              <div style={{height:"100%",width:`${pct}%`,background:r.organic?S.green:S.accent,borderRadius:99}}/>
+                            </div>
+                            <span style={{fontSize:11,color:S.muted}}>{pct}%</span>
+                          </div>
+                        </TD>
+                      </tr>
+                    );
+                  })}</tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {(d.leads?.recent||[]).length>0 && (
+            <>
+              <p style={{fontSize:11,fontWeight:700,color:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.05em",margin:"0 0 6px"}}>Recent leads</p>
+              <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:480}}>
+                  <thead><tr><TH>Lead</TH><TH>Source</TH><TH>Status</TH><TH>Created</TH></tr></thead>
+                  <tbody>{(d.leads.recent||[]).slice(0,10).map((l:{name:string;source:string;status:string;created:string},i:number)=>(
+                    <tr key={i}>
+                      <TD bold>{l.name}</TD>
+                      <TD color={S.muted}>{l.source}</TD>
+                      <TD color={S.muted}>{l.status||"—"}</TD>
+                      <TD color={S.muted}>{l.created?new Date(l.created).toLocaleDateString():"—"}</TD>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          {d.leads?.total===0 && d.deals?.total===0 && (
+            <p style={{fontSize:12,color:S.muted,margin:0}}>Connected to the {String(d.dc).toUpperCase()} data centre, but no Leads or Deals were created in this window.</p>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+// ── Monthly trend charts ──────────────────────────────────────────────────────
+// Two charts over a selectable month range:
+//   1. Channel Mix Trend  — stacked bars, GA4 sessions by channel per month
+//   2. Organic Clicks by Month — grouped bars, GSC clicks per month for every connected site
+// Drawn as inline SVG rather than pulling in a charting library, matching the rest of the app
+// and keeping the bundle (and the Hobby-plan build) small.
+
+const TREND_COLORS = ["#0050EF","#05D9E8","#08B76C","#FFAB00","#EA1C35","#6646D8","#0038AA","#74767C","#095CFF","#B3D3FF","#00287D","#404649"];
+
+// Inclusive list of YYYY-MM between two months.
+function monthsBetween(start: string, end: string): string[] {
+  const out: string[] = [];
+  if(!/^\d{4}-\d{2}$/.test(start) || !/^\d{4}-\d{2}$/.test(end)) return out;
+  const [sy,sm] = start.split("-").map(Number);
+  const [ey,em] = end.split("-").map(Number);
+  let y=sy, m=sm;
+  while(y<ey || (y===ey && m<=em)){
+    out.push(`${y}-${String(m).padStart(2,"0")}`);
+    m++; if(m>12){ m=1; y++; }
+    if(out.length>=36) break;  // hard cap on an absurd custom range
+  }
+  return out;
+}
+const monthLabel = (m:string) => m;
+const isoOf = (m:string, last=false) => {
+  const [y,mo] = m.split("-").map(Number);
+  // Date.UTC, not new Date(y,mo,0): a LOCAL date serialised with toISOString() shifts back a
+  // day in any timezone ahead of UTC, which silently dropped the last day of every month
+  // from the query range.
+  return last ? new Date(Date.UTC(y, mo, 0)).toISOString().split("T")[0] : `${m}-01`;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function StackedBars({months, series, yLabel}:{months:string[]; series:{name:string; values:number[]}[]; yLabel:string}) {
+  const totals = months.map((_,i)=>series.reduce((a,s)=>a+(s.values[i]||0),0));
+  const mx = Math.max(...totals, 1);
+  const W=520,H=280,PADL=46,PADB=38,PADT=14;
+  const bw = Math.max(8,(W-PADL-14)/Math.max(months.length,1)*0.6);
+  const step = (W-PADL-14)/Math.max(months.length,1);
+  const y = (v:number)=> PADT + (1-v/mx)*(H-PADT-PADB);
+  const ticks = [0,0.25,0.5,0.75,1].map(f=>Math.round(mx*f));
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",display:"block"}} role="img" aria-label={yLabel}>
+      {ticks.map((t,i)=>(
+        <g key={i}>
+          <line x1={PADL} x2={W-8} y1={y(t)} y2={y(t)} stroke="#DFE3E5" strokeWidth="1" strokeDasharray={i?"3 3":""}/>
+          <text x={PADL-8} y={y(t)+4} textAnchor="end" style={{font:"10px Lato,sans-serif"}} fill="#74767C">{t>=1000?`${Math.round(t/1000)}k`:t}</text>
+        </g>
+      ))}
+      {months.map((m,i)=>{
+        let acc=0;
+        const x = PADL + i*step + (step-bw)/2;
+        return (
+          <g key={m}>
+            {series.map((s,si)=>{
+              const v=s.values[i]||0; if(!v) return null;
+              const h=(v/mx)*(H-PADT-PADB);
+              acc+=v;
+              const yy=y(acc);
+              return <rect key={si} x={x} y={yy} width={bw} height={Math.max(h,0.5)} fill={TREND_COLORS[si%TREND_COLORS.length]}>
+                <title>{`${m} · ${s.name}: ${v.toLocaleString()}`}</title>
+              </rect>;
+            })}
+            {(months.length<=7||i%2===0)&&<text x={x+bw/2} y={H-PADB+15} textAnchor="middle" style={{font:"10px Lato,sans-serif"}} fill="#74767C">{monthLabel(m)}</text>}
+          </g>
+        );
+      })}
+      <line x1={PADL} x2={W-8} y1={y(0)} y2={y(0)} stroke="#74767C" strokeWidth="1"/>
+    </svg>
+  );
+}
+
+function GroupedBars({months, series, yLabel}:{months:string[]; series:{name:string; values:number[]}[]; yLabel:string}) {
+  const mx = Math.max(1, ...series.flatMap(s=>s.values));
+  const W=520,H=280,PADL=46,PADB=38,PADT=14;
+  const step=(W-PADL-14)/Math.max(months.length,1);
+  const gw=step*0.66;
+  const bw=Math.max(4, gw/Math.max(series.length,1));
+  const y=(v:number)=> PADT+(1-v/mx)*(H-PADT-PADB);
+  const ticks=[0,0.25,0.5,0.75,1].map(f=>Math.round(mx*f));
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:"auto",display:"block"}} role="img" aria-label={yLabel}>
+      {ticks.map((t,i)=>(
+        <g key={i}>
+          <line x1={PADL} x2={W-8} y1={y(t)} y2={y(t)} stroke="#DFE3E5" strokeWidth="1" strokeDasharray={i?"3 3":""}/>
+          <text x={PADL-8} y={y(t)+4} textAnchor="end" style={{font:"10px Lato,sans-serif"}} fill="#74767C">{t>=1000?`${Math.round(t/1000)}k`:t}</text>
+        </g>
+      ))}
+      {months.map((m,i)=>{
+        const gx = PADL + i*step + (step-gw)/2;
+        return (
+          <g key={m}>
+            {series.map((s,si)=>{
+              const v=s.values[i]||0;
+              const h=(v/mx)*(H-PADT-PADB);
+              return <rect key={si} x={gx+si*bw} y={y(v)} width={Math.max(bw-2,2)} height={Math.max(h,0)} fill={TREND_COLORS[si%TREND_COLORS.length]}>
+                <title>{`${m} · ${s.name}: ${v.toLocaleString()}`}</title>
+              </rect>;
+            })}
+            {(months.length<=7||i%2===0)&&<text x={gx+gw/2} y={H-PADB+15} textAnchor="middle" style={{font:"10px Lato,sans-serif"}} fill="#74767C">{monthLabel(m)}</text>}
+          </g>
+        );
+      })}
+      <line x1={PADL} x2={W-8} y1={y(0)} y2={y(0)} stroke="#74767C" strokeWidth="1"/>
+    </svg>
+  );
+}
+
+const Legend = ({items}:{items:string[]}) => (
+  <div style={{display:"flex",flexWrap:"wrap" as const,gap:"6px 14px",marginTop:8}}>
+    {items.map((n,i)=>(
+      <span key={n} style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:11,color:S.text}}>
+        <span style={{width:10,height:10,borderRadius:3,background:TREND_COLORS[i%TREND_COLORS.length],flexShrink:0}}/>{n}
+      </span>
+    ))}
+  </div>
+);
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function MonthlyTrends({gscDataMap={},ga4DataMap={},activeProperty,start,end,rangeLabel}:{gscDataMap?:Record<string,any>;ga4DataMap?:Record<string,any>;activeProperty?:string;start?:string;end?:string;rangeLabel?:string}) {
+  const [loading,setLoading] = useState(false);
+  const [err,setErr] = useState("");
+  const [clicksBySite,setClicksBySite] = useState<Record<string,Record<string,number>>>({});
+  const [channelRows,setChannelRows] = useState<{month:string;channel:string;sessions:number}[]>([]);
+  const [site,setSite] = useState("__all");   // "__all" | a connected GSC site
+  // Google tokens live in httpOnly cookies, which are per-browser. The workspace sync copies
+  // localStorage across machines but cannot copy cookies, so a second laptop shows cached
+  // KPIs yet 401s on every live call. Tracked so the UI can say that instead of "no data".
+  const [needsAuth,setNeedsAuth] = useState(false);
+  const [usedCache,setUsedCache] = useState(false);
+
+  // Driven entirely by the dashboard's header date filter — one range control for the page.
+  const range = { from: String(start||"").slice(0,7), to: String(end||"").slice(0,7) };
+  const allSites = Object.keys(gscDataMap);
+  const sites = site==="__all" ? allSites : allSites.filter(x=>x===site);
+  // Match a GA4 property to the chosen site via its _siteDomain, so the channel chart follows
+  // the selector instead of always showing whichever property happened to be first.
+  const cleanSite = (x:string)=>String(x||"").replace(/^https?:\/\//,"").replace(/^www\./,"").replace(/\/$/,"").toLowerCase();
+  const propForSite = (x:string) => {
+    const want = cleanSite(x);
+    const keys = Object.keys(ga4DataMap);
+    const domOf = (k:string) => cleanSite(ga4DataMap[k]?._siteDomain || k);
+    // Exact match first. Without this a subdomain matches its PARENT's property (whichever
+    // happens to be enumerated first) and silently charts the wrong site's sessions.
+    const exact = keys.find(k=>domOf(k)===want);
+    if(exact) return exact;
+    // Otherwise the most specific related property — longest domain wins.
+    return keys
+      .filter(k=>{ const d=domOf(k); return !!d && (want.endsWith(`.${d}`) || d.endsWith(`.${want}`)); })
+      .sort((a,b)=>domOf(b).length-domOf(a).length)[0] || "";
+  };
+  // Months come from the requested window UNION whatever the APIs actually returned, so a
+  // range the data overruns is never silently cropped to a single bar.
+  const dataMonths = new Set<string>([
+    ...channelRows.map(r=>r.month),
+    ...Object.values(clicksBySite).flatMap(m=>Object.keys(m)),
+  ]);
+  const months = [...new Set([...monthsBetween(range.from, range.to), ...dataMonths])].sort();
+
+  const load = async () => {
+    if(!months.length){ setErr("Pick a start month that is not after the end month."); return; }
+    setLoading(true); setErr(""); setNeedsAuth(false); setUsedCache(false);
+    // Use the exact dates the header resolved, not month boundaries, so the charts cover
+    // the same window as every other number on the page.
+    const qStart = start || isoOf(range.from), qEnd = end || isoOf(range.to, true);
+    try{
+      // GSC: one call per connected site, so each gets its own series in the grouped chart.
+      const perSite: Record<string,Record<string,number>> = {};
+      await Promise.all(sites.map(async site=>{
+        try{
+          const r = await fetch(`/api/gsc?site=${encodeURIComponent(site)}&start=${qStart}&end=${qEnd}&monthly=1`);
+          if(r.status===401){ setNeedsAuth(true); throw new Error("401"); }
+          if(!r.ok) throw new Error(String(r.status));
+          const d = await r.json();
+          const m: Record<string,number> = {};
+          (d.monthly||[]).forEach((x:{month:string;clicks:number})=>{ m[x.month]=x.clicks; });
+          perSite[site]=m;
+        }catch{
+          // Live call unavailable (usually: not signed into Google in THIS browser). The
+          // cached daily series synced with the workspace, so aggregate that instead of
+          // showing an empty chart.
+          const cachedDaily = gscDataMap[site]?.daily;
+          if(Array.isArray(cachedDaily) && cachedDaily.length){
+            const m: Record<string,number> = {};
+            cachedDaily.forEach((x:{date?:string;clicks?:number})=>{
+              const mo = String(x.date||"").slice(0,7);
+              if(mo) m[mo] = (m[mo]||0) + (Number(x.clicks)||0);
+            });
+            if(Object.keys(m).length){ perSite[site]=m; setUsedCache(true); }
+          }
+        }
+      }));
+      setClicksBySite(perSite);
+
+      // GA4: channel mix for the active property.
+      const prop = site==="__all"
+        ? (activeProperty || Object.keys(ga4DataMap)[0] || "")
+        : (propForSite(site) || activeProperty || Object.keys(ga4DataMap)[0] || "");
+      if(prop){
+        try{
+          const r = await fetch(`/api/ga4?property=${encodeURIComponent(prop)}&start=${qStart}&end=${qEnd}&monthly=1`);
+          if(r.status===401) setNeedsAuth(true);
+          else if(r.ok){ const d=await r.json(); setChannelRows(d.monthly_channels||[]); }
+        }catch{/* channel mix is optional */}
+      }
+      if(!sites.length && !prop) setErr("Connect Search Console or GA4 to see monthly trends.");
+    }catch(e){ setErr(e instanceof Error?e.message:"Could not load trends"); }
+    finally{ setLoading(false); }
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(()=>{ if(start&&end) load(); },[start,end,site]);
+
+  // Channel series: one stack segment per channel, ordered by total size.
+  const channelNames = (()=>{
+    const t = new Map<string,number>();
+    channelRows.forEach(r=>t.set(r.channel,(t.get(r.channel)||0)+r.sessions));
+    return [...t.entries()].sort((a,b)=>b[1]-a[1]).slice(0,12).map(([c])=>c);
+  })();
+  const channelSeries = channelNames.map(name=>({
+    name,
+    values: months.map(m=>channelRows.filter(r=>r.month===m&&r.channel===name).reduce((a,r)=>a+r.sessions,0)),
+  }));
+  const siteSeries = sites.map(site=>({ name:site, values: months.map(m=>clicksBySite[site]?.[m]||0) }));
+  const hasChannels = channelSeries.some(s=>s.values.some(v=>v>0));
+  const hasClicks = siteSeries.some(s=>s.values.some(v=>v>0));
+
+  return (
+    <Card id="sec-trends" style={{marginBottom:20,scrollMarginTop:64}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap" as const,gap:8}}>
+        <div>
+          <p style={{fontSize:13,fontWeight:700,color:S.text,margin:"0 0 2px"}}>Monthly trends</p>
+          <p style={{fontSize:11,color:S.muted,margin:0}}>Channel mix and organic clicks, month by month{rangeLabel?` · ${rangeLabel.toLowerCase()}`:""}{site!=="__all"?` · ${site}`:allSites.length>1?" · all sites":""}.</p>
+        </div>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          {allSites.length>1 && (
+            <select value={site} onChange={e=>setSite(e.target.value)}
+              style={{fontSize:12,padding:"5px 8px",border:`1px solid ${S.border}`,borderRadius:6,background:"#fff",color:S.text,fontFamily:"inherit",fontWeight:600}}>
+              <option value="__all">All sites</option>
+              {allSites.map(x=><option key={x} value={x}>{x}</option>)}
+            </select>
+          )}
+          {loading && <span style={{fontSize:11,color:S.muted}}>Loading…</span>}
+        </div>
+      </div>
+
+      {err && <p style={{fontSize:12,color:S.red,margin:"0 0 10px"}}>⚠ {err}</p>}
+      {needsAuth && (
+        <p style={{fontSize:12,color:S.amberText,background:S.amberBg,border:"1px solid #fde68a",borderRadius:8,padding:"8px 12px",margin:"0 0 12px",lineHeight:1.55}}>
+          &#9888; Google isn&apos;t connected <strong>in this browser</strong>. Saved sites and cached numbers follow your account, but Search Console and GA4 sign-ins are stored as browser cookies and cannot sync. Open <strong>Search Console</strong> or <strong>GA4</strong> from the sidebar on this machine, connect with Google, then reload.
+        </p>
+      )}
+      {usedCache && !needsAuth && (
+        <p style={{fontSize:11,color:S.muted,margin:"0 0 10px"}}>Showing cached data &mdash; live Search Console calls were unavailable, so these months were rebuilt from the last synced daily figures.</p>
+      )}
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(360px,1fr))",gap:16,alignItems:"start"}}>
+        <div style={{border:`1px solid ${S.border}`,borderRadius:10,padding:"12px 14px"}}>
+          <p style={{fontSize:12,fontWeight:700,color:S.text,margin:"0 0 2px"}}>Channel Mix Trend</p>
+          <p style={{fontSize:10,color:S.muted,margin:"0 0 8px"}}>GA4 sessions by channel{site!=="__all"&&!propForSite(site)?" · no GA4 property matched this site, showing the default":""} · hover a segment for the value</p>
+          {hasChannels
+            ? <><StackedBars months={months} series={channelSeries} yLabel="Total sessions"/><Legend items={channelNames}/></>
+            : <p style={{fontSize:12,color:S.muted,margin:"14px 0"}}>{loading?"Loading…":needsAuth?"Needs a Google sign-in in this browser — a channel split cannot be rebuilt from cache.":"No GA4 channel data for this range."}</p>}
+        </div>
+        <div style={{border:`1px solid ${S.border}`,borderRadius:10,padding:"12px 14px"}}>
+          <p style={{fontSize:12,fontWeight:700,color:S.text,margin:"0 0 2px"}}>Organic Clicks by Month</p>
+          <p style={{fontSize:10,color:S.muted,margin:"0 0 8px"}}>Search Console clicks per connected site</p>
+          {hasClicks
+            ? <><GroupedBars months={months} series={siteSeries} yLabel="Total clicks"/><Legend items={sites}/></>
+            : <p style={{fontSize:12,color:S.muted,margin:"14px 0"}}>{loading?"Loading…":needsAuth?"Needs a Google sign-in in this browser.":"No Search Console clicks for this range."}</p>}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function DashboardIssues({domain,hasAny,setPage}:{domain:string;hasAny:boolean;setPage:(p:string)=>void}) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [crawl,setCrawl]=useState<any>(null);
@@ -932,6 +2005,8 @@ function Dashboard({setPage,gscData:_gscData,ga4Data:_ga4Data,aeoData:_aeoData,s
   // domain string — strictly from selected site's data
   const domain = viewDomain || viewGsc?.domain || viewGa4?.domain || "";
   const hasAny = !!(viewGsc||viewGa4);
+  const [shareBusy,setShareBusy]=useState(false);
+  const [shareUrl,setShareUrl]=useState("");
 
   // One-click handoff: seed the SEO Campaign Agent with this gap keyword + active domain
   const seedBlog = (keyword:string) => {
@@ -1124,23 +2199,6 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
     finally{setAeoLoading(false);setAeoPhase("");}
   };
 
-  // ── Sparkline helper ──
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const Sparkline = ({data,key:_k,color=S.accent,height=48}:{data:any[];key?:string;color?:string;height?:number}) => {
-    const vals = data.map((d:any)=>d.sessions||d.clicks||0);
-    const mx = Math.max(...vals,1);
-    const w = Math.max(data.length*18,200);
-    const pts = vals.map((v:number,i:number)=>`${i*(w/(data.length-1||1))},${height-4-Math.round((v/mx)*(height-8))}`).join(" ");
-    return (
-      <svg width="100%" viewBox={`0 0 ${w} ${height}`} style={{display:"block",overflow:"visible"}}>
-        <polyline fill="none" stroke={color} strokeWidth="1.8" strokeLinejoin="round" points={pts}/>
-        {vals.map((v:number,i:number)=>{
-          const x=i*(w/(data.length-1||1)),y=height-4-Math.round((v/mx)*(height-8));
-          return i===vals.length-1?<circle key={i} cx={x} cy={y} r="3" fill={color}/>:null;
-        })}
-      </svg>
-    );
-  };
 
   // ── KPI card ──
   const KPI = ({label,value,change,inv=false,color,sub,onClick}:{label:string;value:string;change?:number;inv?:boolean;color?:string;sub?:string;onClick?:()=>void}) => {
@@ -1188,6 +2246,32 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
           <p style={{fontSize:13,color:S.muted,margin:0}}>Website performance, AI search visibility, and keyword rankings — {rangeLabel.toLowerCase()}.</p>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap" as const}}>
+          {hasAny&&(<>
+            <button onClick={()=>{
+              const ok=openDashboardReport({domain:viewDomain||domain,rangeLabel,prevLabel,gsc:viewGsc,ga4:viewGa4,vis:realVis||aeoData});
+              if(!ok) alert("Your browser blocked the report window, so it was downloaded as an HTML file instead. Open it and press Ctrl+P to save as PDF.");
+            }} title="Open the interactive report (download or save as PDF from there)"
+              style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12,fontWeight:700,color:"#fff",background:"linear-gradient(135deg,#6366f1,#818cf8)",border:"none",borderRadius:8,padding:"6px 14px",cursor:"pointer",fontFamily:"inherit"}}>
+              ↓ PDF report
+            </button>
+            <button onClick={async()=>{
+              if(shareBusy)return;
+              setShareBusy(true);setShareUrl("");
+              try{
+                const html=buildDashboardReport({domain:viewDomain||domain,rangeLabel,prevLabel,gsc:viewGsc,ga4:viewGa4,vis:realVis||aeoData});
+                const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tool:"report_share",html})});
+                const d=await r.json();
+                if(d.error)throw new Error(d.error);
+                const url=`${window.location.origin}${d.path}`;
+                setShareUrl(url);
+                try{ await navigator.clipboard.writeText(url); }catch{/* clipboard needs a secure context; the link is shown regardless */}
+              }catch(e){ setShareUrl(""); alert(`Could not create a share link: ${e instanceof Error?e.message:"failed"}`); }
+              finally{ setShareBusy(false); }
+            }} disabled={shareBusy} title="Publish a link anyone can open — no login needed, expires in 30 days"
+              style={{display:"inline-flex",alignItems:"center",gap:6,fontSize:12,fontWeight:700,color:shareBusy?S.muted:S.accentText,background:S.accentBg,border:"1px solid #c7d2fe",borderRadius:8,padding:"6px 14px",cursor:shareBusy?"default":"pointer",fontFamily:"inherit"}}>
+              {shareBusy?"Creating link…":"🔗 Share link"}
+            </button>
+          </>)}
           {allSites.length>0&&(
             <div style={{display:"flex",alignItems:"center",gap:6}}>
               <div style={{position:"relative" as const,display:"inline-flex",alignItems:"center"}}>
@@ -1216,6 +2300,16 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
         </div>
       </div>
       {rangeErr&&<div style={{fontSize:12,color:S.red,background:S.redBg,border:"1px solid #fecaca",borderRadius:8,padding:"6px 12px",marginBottom:12}}>⚠ {rangeErr}</div>}
+      {shareUrl&&(
+        <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap" as const,margin:"-4px 0 14px",padding:"8px 12px",background:"#ecfdf5",border:"1px solid #a7f3d0",borderRadius:8}}>
+          <span style={{fontSize:12,fontWeight:700,color:S.greenText}}>🔗 Link copied — anyone with it can view this report</span>
+          <input readOnly value={shareUrl} onFocus={e=>e.currentTarget.select()}
+            style={{flex:1,minWidth:260,fontSize:11,color:S.text,background:"#fff",border:`1px solid ${S.border}`,borderRadius:6,padding:"5px 8px",fontFamily:"inherit"}}/>
+          <a href={shareUrl} target="_blank" rel="noopener" style={{fontSize:11,fontWeight:700,color:S.accentText}}>Open ↗</a>
+          <span style={{fontSize:11,color:S.muted}}>Expires in 30 days</span>
+          <button onClick={()=>setShareUrl("")} style={{fontSize:11,color:S.muted,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit"}}>Dismiss</button>
+        </div>
+      )}
       {hasAny&&prevLabel&&<p style={{fontSize:11,color:S.muted,margin:"-8px 0 14px"}}>📊 Each metric&apos;s ▲▼ delta compares <strong>{rangeLabel.toLowerCase()}</strong> vs the previous equal period (<strong>{prevLabel}</strong>).</p>}
 
       {/* ── CONNECT BANNERS (if nothing connected) ── */}
@@ -1257,6 +2351,9 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
             {id:"sec-overview",label:"Overview"},
             {id:"sec-ai",label:"AI Visibility"},
             {id:"sec-gaps",label:"Content Gaps"},
+            {id:"sec-trends",label:"Monthly Trends"},
+            {id:"sec-tracked",label:"Tracked Keywords"},
+            {id:"sec-crm",label:"CRM Pipeline"},
             {id:"sec-keywords",label:"Keywords"},
             {id:"sec-issues",label:"Site Issues"},
           ].map(t=>(
@@ -1276,11 +2373,10 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:12}}>
             <KPI label="Organic Clicks" value={viewGsc?viewGsc.summary.clicks.toLocaleString():"—"} change={viewGsc?viewGsc.summary.clicks_change:undefined} onClick={()=>{if(!viewGsc&&activeSite)localStorage.setItem("rm_auto_gsc_site",activeSite);setPage("gsc");}}/>
             <KPI label="Sessions" value={viewGa4?viewGa4.summary.sessions.toLocaleString():"—"} change={viewGa4?viewGa4.summary.sessions_change:undefined} onClick={()=>{if(!viewGa4&&activeSite)localStorage.setItem("rm_auto_ga4_prop",activeSite);setPage("ga4");}}/>
-            <KPI label="Conversions" value={viewGa4?viewGa4.summary.conversions.toLocaleString():"—"} sub={viewGa4?viewGa4.summary.conv_rate+"% rate":undefined} change={viewGa4?viewGa4.summary.conv_change:undefined} color={viewGa4?S.green:undefined} onClick={()=>{if(!viewGa4&&activeSite)localStorage.setItem("rm_auto_ga4_prop",activeSite);setPage("ga4");}}/>
             <KPI label="Avg Position" value={viewGsc?("#"+viewGsc.summary.pos.toFixed(1)):"—"} change={viewGsc?viewGsc.summary.pos_change:undefined} inv color={viewGsc?S.accent:undefined} onClick={()=>{if(!viewGsc&&activeSite)localStorage.setItem("rm_auto_gsc_site",activeSite);setPage("gsc");}}/>
+            <KPI label="Impressions" value={viewGsc?viewGsc.summary.impressions.toLocaleString():"—"} change={viewGsc?viewGsc.summary.impressions_change:undefined}/>
           </div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:viewGa4&&viewGsc?20:12}}>
-            <KPI label="Impressions" value={viewGsc?viewGsc.summary.impressions.toLocaleString():"—"} change={viewGsc?viewGsc.summary.impressions_change:undefined}/>
             <KPI label="Users" value={viewGa4?viewGa4.summary.users.toLocaleString():"—"} change={viewGa4?viewGa4.summary.users_change:undefined}/>
             <KPI label="Bounce Rate" value={viewGa4?(viewGa4.summary.bounce_rate+"%"):"—"} change={viewGa4?viewGa4.summary.bounce_change:undefined} inv/>
             <KPI label="Avg CTR" value={viewGsc?(viewGsc.summary.ctr.toFixed(1)+"%"):"—"} change={viewGsc?viewGsc.summary.ctr_change:undefined}/>
@@ -1317,40 +2413,8 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
 
       {/* ── SECTION 2: TRAFFIC CHARTS ── */}
       {hasAny && (
-        <div style={{display:"grid",gridTemplateColumns:viewGsc&&viewGa4?"1fr 1fr":"1fr",gap:14,marginBottom:20}}>
-          {viewGa4 && (
-            <Card style={{marginBottom:0}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
-                <div>
-                  <p style={{fontSize:13,fontWeight:700,color:S.text,margin:"0 0 2px"}}>Sessions trend</p>
-                  <p style={{fontSize:11,color:S.muted,margin:0}}>Daily sessions · last 28 days</p>
-                </div>
-                <button onClick={()=>setPage("ga4")} style={{fontSize:11,color:S.accentText,fontWeight:600,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>View full →</button>
-              </div>
-              <Sparkline data={viewGa4.daily} color={S.green} height={60}/>
-              <div style={{display:"flex",justifyContent:"space-between",marginTop:6,fontSize:11,color:S.muted}}>
-                {viewGa4.daily.length>1&&<span>{viewGa4.daily[0].date}</span>}
-                {viewGa4.daily.length>1&&<span>{viewGa4.daily[viewGa4.daily.length-1].date}</span>}
-              </div>
-            </Card>
-          )}
-          {viewGsc && (
-            <Card style={{marginBottom:0}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
-                <div>
-                  <p style={{fontSize:13,fontWeight:700,color:S.text,margin:"0 0 2px"}}>Search clicks trend</p>
-                  <p style={{fontSize:11,color:S.muted,margin:0}}>Daily organic clicks · last 28 days</p>
-                </div>
-                <button onClick={()=>setPage("gsc")} style={{fontSize:11,color:S.accentText,fontWeight:600,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>View full →</button>
-              </div>
-              <Sparkline data={viewGsc.daily} color={S.accent} height={60}/>
-              <div style={{display:"flex",justifyContent:"space-between",marginTop:6,fontSize:11,color:S.muted}}>
-                {viewGsc.daily.length>1&&<span>{viewGsc.daily[0].date}</span>}
-                {viewGsc.daily.length>1&&<span>{viewGsc.daily[viewGsc.daily.length-1].date}</span>}
-              </div>
-            </Card>
-          )}
-        </div>
+        <MonthlyTrends gscDataMap={gscDataMap} ga4DataMap={ga4DataMap}
+          start={curRange?.start} end={curRange?.end} rangeLabel={rangeLabel}/>
       )}
 
       {/* ── SECTION 3: AI SEARCH VISIBILITY (real data) ── */}
@@ -1589,6 +2653,12 @@ Return ONLY valid JSON: {"performing_topics":[{"topic":"string","visibility":num
           </Card>
         );
       })()}
+
+      {/* ── ZOHO CRM PIPELINE (organic search → revenue) ── */}
+      <ZohoPipeline/>
+
+      {/* ── TRACKED KEYWORDS (user watchlist, period over period) ── */}
+      {hasAny && <TrackedKeywords domain={viewDomain||domain} gsc={viewGsc} rangeLabel={rangeLabel} prevLabel={prevLabel}/>}
 
       {/* ── KEYWORD POSITION DISTRIBUTION (above the rankings table) ── */}
       {viewGsc && viewGsc.queries?.length > 0 && (()=>{
@@ -2008,16 +3078,34 @@ function GSC({gscData:_gscData,setGscData,activeSite,gscDataMap={},upsertGsc}:{g
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [availableSites,setAvailableSites] = useState<any[]|null>(null);
   const [sitesLoading,setSitesLoading] = useState(false);
+  // Manual host entry. A subdomain covered by a parent domain property has no property of
+  // its own, so it never appears in the picker list and was impossible to select.
+  const [manualHost,setManualHost] = useState("");
 
   // Strict: never fall back to a different site's data
   const viewData = gscDataMap[viewDomain] || null;
 
   // Fetch the exact GSC property URL using the site analytics API
-  const fetchData = async (siteUrl: string, days: number) => {
+  // allowAuthRedirect=false is passed when we have JUST come back from Google. Without it a
+  // property the account cannot access 401s forever: fetch -> redirect -> return -> fetch,
+  // an endless re-verify loop with nothing shown to the user.
+  const fetchData = async (siteUrl: string, days: number, allowAuthRedirect = true) => {
     setLoading(true); setErr(""); setErrDomain("");
     try {
       const res = await fetch(`/api/gsc?site=${encodeURIComponent(siteUrl)}&days=${days}`);
-      if (res.status === 401) { localStorage.setItem("rm_auto_gsc_site", siteUrl); window.location.href = `/api/auth?site=${encodeURIComponent(siteUrl)}`; return; }
+      if (res.status === 401) {
+        // The loop is already impossible: the post-OAuth resume passes allowAuthRedirect=false
+        // and therefore never bounces back to Google. An extra once-per-session marker on top
+        // of that was wrong — it also blocked DELIBERATE retries, so every click after the
+        // first reported a sign-in that had never actually been attempted.
+        if (allowAuthRedirect) {
+          localStorage.setItem("rm_auto_gsc_site", siteUrl);
+          window.location.href = `/api/auth?site=${encodeURIComponent(siteUrl)}`;
+          return;
+        }
+        const b = await res.json().catch(()=>({}));
+        throw new Error(b.error || "Google sign-in finished but no usable token came back. Click the property again to retry the sign-in.");
+      }
       if (!res.ok) { const b = await res.json(); throw new Error(b.error || "API error"); }
       const data = await res.json();
       setGscData(data);
@@ -2050,7 +3138,14 @@ function GSC({gscData:_gscData,setGscData,activeSite,gscDataMap={},upsertGsc}:{g
 
   // After OAuth return: list available properties so user picks the right one
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(()=>{ if(property==="browse"){ setProperty(""); setShowAdd(true); browseProperties(); } },[]);
+  useEffect(()=>{
+    if(property==="browse"){ setProperty(""); setShowAdd(true); browseProperties(); return; }
+    // A 401 sends the user through Google and stores the host in rm_auto_gsc_site. On the way
+    // back only the "browse" case was handled, so a named site silently did nothing — the user
+    // round-tripped through OAuth and landed on an unchanged page with no site added and no error.
+    if(property && !gscDataMap[property]){ setProperty(""); setShowAdd(true); fetchData(property, 28, false); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
 
   const disconnect = (domain: string) => {
     if(upsertGsc) upsertGsc(domain, null); else setGscData(null);
@@ -2136,13 +3231,47 @@ function GSC({gscData:_gscData,setGscData,activeSite,gscDataMap={},upsertGsc}:{g
       )}
       {showAdd && allDomains.length>0 && (
         (availableSites||sitesLoading) ? (
-          <PropertyPicker onPick={(url)=>fetchData(url,28)}/>
+          <>
+            <PropertyPicker onPick={(url)=>fetchData(url,28)}/>
+            <Card style={{marginBottom:16}}>
+              <SH title="Or add a subdomain"/>
+              {err && <p style={{fontSize:13,color:S.red,margin:"0 0 10px",lineHeight:1.5}}>⚠ {errDomain?`${errDomain}: `:""}{err}</p>}
+              <p style={{fontSize:12,color:S.muted,margin:"0 0 10px",lineHeight:1.5}}>
+                A subdomain covered by a domain property (for example <strong>digital.compunnel.com</strong> under <strong>sc-domain:compunnel.com</strong>) has no property of its own, so it is not in the list above. Type it here and its data will be read through the parent property and filtered to that subdomain.
+              </p>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap" as const}}>
+                <div style={{flex:1,minWidth:240}}>
+                  <TI value={manualHost} onChange={setManualHost} placeholder="digital.compunnel.com"/>
+                </div>
+                <Btn small onClick={()=>{const hv=manualHost.trim().replace(/^https?:\/\//,"").replace(/\/.*$/,"");if(hv)fetchData(hv,28);}} disabled={loading||!manualHost.trim()}>
+                  {loading?"Adding…":"Add site"}
+                </Btn>
+              </div>
+            </Card>
+          </>
         ) : (
           <Card style={{marginBottom:16}}>
             <SH title="Connect another site"/>
-            {err && errDomain==="" && <p style={{fontSize:13,color:S.red,margin:"0 0 10px"}}>⚠ {err}</p>}
-            <Btn onClick={connect} disabled={loading}>{loading?"Connecting...":"Connect with Google"}</Btn>
-            <p style={{fontSize:11,color:S.muted,margin:"8px 0 0",lineHeight:1.5}}>You'll sign in with Google and pick from your verified Search Console properties.</p>
+            {/* Show ANY error raised while adding. This previously required errDomain==="",
+                which fetchData's catch never leaves empty, so add failures were silent. */}
+            {err && <p style={{fontSize:13,color:S.red,margin:"0 0 10px",lineHeight:1.5}}>⚠ {errDomain?`${errDomain}: `:""}{err}</p>}
+            {/* Already authenticated? Listing properties needs no second OAuth round-trip. */}
+            <div style={{display:"flex",gap:8,flexWrap:"wrap" as const,marginBottom:14}}>
+              <Btn onClick={connect} disabled={loading}>{loading?"Connecting...":"Connect with Google"}</Btn>
+              <Btn variant="secondary" onClick={browseProperties} disabled={sitesLoading}>{sitesLoading?"Loading…":"Browse my properties"}</Btn>
+            </div>
+            <p style={{fontSize:12,fontWeight:700,color:S.text,margin:"0 0 4px"}}>Or add a subdomain directly</p>
+            <p style={{fontSize:11,color:S.muted,margin:"0 0 8px",lineHeight:1.5}}>
+              A subdomain covered by a domain property (for example <strong>digital.compunnel.com</strong> under <strong>sc-domain:compunnel.com</strong>) has no Search Console property of its own, so it never appears in the property list. Entered here, it is read through the parent property and filtered to that subdomain.
+            </p>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap" as const}}>
+              <div style={{flex:1,minWidth:240}}>
+                <TI value={manualHost} onChange={setManualHost} placeholder="digital.compunnel.com"/>
+              </div>
+              <Btn small onClick={()=>{const hv=manualHost.trim().replace(/^https?:\/\//,"").replace(/\/.*$/,"");if(hv)fetchData(hv,28);}} disabled={loading||!manualHost.trim()}>
+                {loading?"Adding…":"Add site"}
+              </Btn>
+            </div>
           </Card>
         )
       )}
@@ -8092,6 +9221,7 @@ function EditorialCalendar({activeSite}:PageProps) {
   const [keywords,setKeywords]=useState("");
   const [audience,setAudience]=useState("");
   const [goals,setGoals]=useState("");
+  const [comps,setComps]=useState("");
   const [months,setMonths]=useState("3");
   const [loading,setLoading]=useState(false);
   const [err,setErr]=useState("");
@@ -8103,14 +9233,16 @@ function EditorialCalendar({activeSite}:PageProps) {
     setLoading(true);setErr("");setCal(null);
     try{
       const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({tool:"calendar",domain:domain.trim(),keywords:keywords.split(",").map(k=>k.trim()).filter(Boolean),months:Number(months)||3,audience,goals})});
+        body:JSON.stringify({tool:"calendar",domain:domain.trim(),keywords:keywords.split(",").map(k=>k.trim()).filter(Boolean),competitors:comps.split(",").map(c=>c.trim()).filter(Boolean),months:Number(months)||3,audience,goals})});
       const d=await r.json();
       if(d.error)throw new Error(d.error);
       setCal(d.calendar);setSelMonth(0);
     }catch(e){setErr(e instanceof Error?e.message:"Failed");}
     finally{setLoading(false);}
   };
-  const typeColors:Record<string,string>={guide:"#6366f1",listicle:"#10b981","how-to":"#3b82f6","case-study":"#f59e0b",comparison:"#ec4899",news:"#64748b",interview:"#8b5cf6"};
+  const typeColors:Record<string,string>={guide:"#6366f1",listicle:"#10b981","how-to":"#3b82f6","case-study":"#f59e0b",comparison:"#ec4899",news:"#64748b",interview:"#8b5cf6",
+    blog:"#6366f1",ebook:"#0ea5e9",report:"#dc2626",whitepaper:"#7c3aed",webinar:"#db2777",infographic:"#059669",checklist:"#ca8a04"};
+  const assetLabels:Record<string,string>={blog:"Blogs","case-study":"Case studies",ebook:"Ebooks",report:"Reports",whitepaper:"Whitepapers",webinar:"Webinars",infographic:"Infographics",checklist:"Checklists"};
   const intentColors:Record<string,string>={informational:S.blue,commercial:S.amber,transactional:S.green,navigational:S.muted};
   const monthData=cal?.months?.[selMonth];
   return(
@@ -8127,19 +9259,22 @@ function EditorialCalendar({activeSite}:PageProps) {
           <Field label="Target audience (optional)"><TI value={audience} onChange={setAudience} placeholder="e.g. HR managers, tech recruiters"/></Field>
           <Field label="Content goals (optional)"><TI value={goals} onChange={setGoals} placeholder="e.g. drive signups, build topical authority"/></Field>
         </div>
-        <Btn onClick={run} disabled={loading||!domain.trim()}>{loading?"Generating calendar…":"Generate Editorial Calendar"}</Btn>
+        <Field label="Competitors (optional — auto-discovered from live SERPs if left blank)"><TI value={comps} onChange={setComps} placeholder="e.g. competitor1.com, competitor2.com"/></Field>
+        <p style={{fontSize:11,color:S.muted,margin:"0 0 12px",lineHeight:1.5}}>Every plan ships at least <strong>{Math.max(10,4*(Number(months)||3))} blogs, {Math.max(2,Math.ceil((Number(months)||3)/1.5))} case studies, {Math.max(1,Math.floor((Number(months)||3)/3))} ebook{Math.max(1,Math.floor((Number(months)||3)/3))>1?"s":""} and {Math.max(1,Math.floor((Number(months)||3)/3))} report{Math.max(1,Math.floor((Number(months)||3)/3))>1?"s":""}</strong>, plus supporting formats — planned against real competitor keyword gaps.</p>
+        <Btn onClick={run} disabled={loading||!domain.trim()}>{loading?"Researching & generating…":"Research & Generate Calendar"}</Btn>
         {err&&<p style={{color:S.red,fontSize:13,margin:"8px 0 0"}}>{err}</p>}
       </Card>
-      {loading&&<Card><LoadingBar phases={["Analysing domain & industry…","Researching keyword opportunities…","Planning content themes…","Scheduling posts by week…","Assigning schema types…"]}/></Card>}
+      {loading&&<Card><LoadingBar phases={["Scraping site & sitemap…","Pulling organic footprint…","Discovering competitors from live SERPs…","Mining competitor keyword gaps…","Building content strategy…","Planning assets month by month…","Checking the asset quota…"]}/></Card>}
       {cal&&(
         <div>
           {/* Summary strip */}
           <div style={{display:"flex",gap:12,flexWrap:"wrap" as const,marginBottom:16}}>
             {[
-              ["Total Posts",(cal.months||[]).reduce((a:number,m:{posts?:unknown[]})=>a+((m.posts||[]).length),0)],
+              ["Total Assets",(cal.months||[]).reduce((a:number,m:{posts?:unknown[]})=>a+((m.posts||[]).length),0)],
               ["Months Planned",(cal.months||[]).length],
+              ["Competitors Analysed",(cal.research?.competitors||[]).length],
+              ["Gap Keywords Found",(cal.research?.gaps||[]).length],
               ["Pillar Topics",(cal.pillar_topics||[]).length],
-              ["Quick Wins",(cal.quick_wins||[]).length],
             ].map(([l,v])=>(
               <div key={String(l)} style={{background:S.card,border:`1px solid ${S.border}`,borderRadius:10,padding:"14px 20px",flex:1,minWidth:120,boxShadow:S.shadow}}>
                 <p style={{fontSize:11,fontWeight:600,color:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.05em",margin:"0 0 4px"}}>{l}</p>
@@ -8147,6 +9282,81 @@ function EditorialCalendar({activeSite}:PageProps) {
               </div>
             ))}
           </div>
+          {/* Asset mix vs. the required quota */}
+          {(cal.asset_mix||[]).length>0&&(
+            <Card style={{marginBottom:14}}>
+              <SH title="Asset mix"/>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap" as const,marginBottom:(cal.shortfall||[]).length?10:0}}>
+                {(cal.asset_mix||[]).map((m:{asset:string;required:number;planned:number})=>{
+                  const short=m.planned<m.required;
+                  return (
+                    <div key={m.asset} style={{display:"flex",alignItems:"center",gap:7,padding:"6px 12px",borderRadius:8,background:short?S.redBg:S.subtle,border:`1px solid ${short?"#fecaca":S.border}`}}>
+                      <span style={{width:8,height:8,borderRadius:99,background:typeColors[m.asset]||S.muted}}/>
+                      <span style={{fontSize:12,fontWeight:600,color:S.text}}>{assetLabels[m.asset]||m.asset}</span>
+                      <span style={{fontSize:12,fontWeight:700,color:short?S.red:S.green}}>{m.planned}</span>
+                      <span style={{fontSize:10,color:S.muted}}>min {m.required}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              {(cal.shortfall||[]).length>0&&<p style={{fontSize:11,color:S.red,margin:0}}>⚠ Under quota on {(cal.shortfall||[]).map((s:{asset:string})=>assetLabels[s.asset]||s.asset).join(", ")} — regenerate to try again.</p>}
+            </Card>
+          )}
+
+          {/* Research the plan is built on */}
+          {cal.research&&(
+            <Card style={{marginBottom:14}}>
+              <SH title="Research"/>
+              {cal.positioning&&<p style={{fontSize:12,color:S.text,margin:"0 0 4px",lineHeight:1.5}}><strong>Positioning:</strong> {cal.positioning}</p>}
+              {cal.icp&&<p style={{fontSize:12,color:S.muted,margin:"0 0 10px",lineHeight:1.5}}><strong>Audience:</strong> {cal.icp}</p>}
+              <div style={{display:"flex",gap:8,flexWrap:"wrap" as const,marginBottom:12}}>
+                {[
+                  ["Ranking keywords",(cal.research.site?.keywords||0).toLocaleString()],
+                  ["Monthly organic traffic",`~${(cal.research.site?.traffic||0).toLocaleString()}`],
+                  ["Top-10 rankings",cal.research.site?.top10||0],
+                  ["URLs in sitemap",cal.research.site?.pages_found||0],
+                ].map(([l,v])=>(
+                  <div key={String(l)} style={{padding:"6px 12px",borderRadius:8,background:S.subtle,border:`1px solid ${S.border}`}}>
+                    <span style={{fontSize:11,color:S.muted}}>{l}: </span><span style={{fontSize:12,fontWeight:700,color:S.text}}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              {(cal.research.competitors||[]).length>0&&(
+                <div style={{overflowX:"auto",marginBottom:12}}>
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:520}}>
+                    <thead><tr><TH>Competitor</TH><TH>Keywords</TH><TH>Traffic</TH><TH>SERP Hits</TH><TH>Keywords We Miss</TH></tr></thead>
+                    <tbody>{(cal.research.competitors||[]).map((c:{domain:string;keywords:number;traffic:number;appearances:number;gap_keywords:unknown[]},i:number)=>(
+                      <tr key={i}>
+                        <TD bold>{c.domain}</TD>
+                        <TD color={S.muted}>{(c.keywords||0).toLocaleString()}</TD>
+                        <TD color={S.muted}>{(c.traffic||0).toLocaleString()}</TD>
+                        <TD color={S.muted}>{c.appearances||0}</TD>
+                        <TD><span style={{fontSize:12,fontWeight:700,color:S.amber}}>{(c.gap_keywords||[]).length}</span></TD>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              )}
+              {(cal.competitor_insights||[]).map((c:{domain:string;what_they_win:string;how_to_beat:string},i:number)=>(
+                <div key={i} style={{padding:"8px 10px",borderRadius:6,background:S.subtle,border:`1px solid ${S.border}`,marginBottom:6}}>
+                  <p style={{fontSize:12,fontWeight:700,color:S.text,margin:"0 0 2px"}}>{c.domain}</p>
+                  <p style={{fontSize:11,color:S.muted,margin:0,lineHeight:1.5}}>Wins on: {c.what_they_win} — <span style={{color:S.greenText}}>beat it by {c.how_to_beat}</span></p>
+                </div>
+              ))}
+              {(cal.research.gaps||[]).length>0&&(
+                <>
+                  <p style={{fontSize:11,fontWeight:700,color:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.05em",margin:"12px 0 6px"}}>Top gap keywords driving this plan</p>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap" as const}}>
+                    {(cal.research.gaps||[]).slice(0,20).map((g:{keyword:string;volume:number;kd:number},i:number)=>(
+                      <span key={i} style={{fontSize:10,color:S.accentText,background:S.accentBg,border:"1px solid #c7d2fe",padding:"3px 8px",borderRadius:4}}>{g.keyword} <span style={{color:S.muted}}>· {(g.volume||0).toLocaleString()}/mo · KD {g.kd||0}</span></span>
+                    ))}
+                  </div>
+                </>
+              )}
+              {(cal.research.sources||[]).length>0&&<p style={{fontSize:10,color:S.muted,margin:"12px 0 0"}}>Sources: {(cal.research.sources||[]).join(" · ")}</p>}
+            </Card>
+          )}
+
           {/* Month tabs */}
           <div style={{display:"flex",gap:4,marginBottom:14,flexWrap:"wrap" as const}}>
             {(cal.months||[]).map((m:{month:string},i:number)=>(
@@ -8161,10 +9371,10 @@ function EditorialCalendar({activeSite}:PageProps) {
                     <p style={{fontSize:15,fontWeight:700,color:S.text,margin:"0 0 2px"}}>{monthData.month}</p>
                     <p style={{fontSize:12,color:S.accent,margin:0}}>Theme: {monthData.theme}</p>
                   </div>
-                  <button onClick={()=>{const rows=["Week,Title,Type,Keywords,Intent,Schema,Word Count,Priority"];(monthData.posts||[]).forEach((p:{week:number;title:string;type:string;keywords:string[];intent:string;schema:string;word_count:number;priority:string})=>rows.push(`${p.week},"${p.title}",${p.type},"${(p.keywords||[]).join(";")}",${p.intent},${p.schema},${p.word_count},${p.priority}`));const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(rows.join("\n"));a.download=`calendar-${monthData.month}.csv`;a.click();}} style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ Export CSV</button>
+                  <button onClick={()=>{const rows=["Week,Title,Asset,Type,Keywords,Intent,Funnel,Gated,Schema,Word Count,Priority,CTA"];(monthData.posts||[]).forEach((p:{week:number;title:string;type:string;asset?:string;keywords:string[];intent:string;schema:string;word_count:number;priority:string;funnel_stage?:string;gated?:boolean;cta?:string})=>rows.push(`${p.week},"${p.title}",${p.asset||p.type},${p.type},"${(p.keywords||[]).join(";")}",${p.intent},${p.funnel_stage||""},${p.gated?"yes":"no"},${p.schema},${p.word_count},${p.priority},"${(p.cta||"").replace(/"/g,"'")}"`));const a=document.createElement("a");a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(rows.join("\n"));a.download=`calendar-${monthData.month}.csv`;a.click();}} style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ Export CSV</button>
                 </div>
                 <div style={{display:"grid",gap:10}}>
-                  {(monthData.posts||[]).map((post:{week:number;title:string;type:string;keywords:string[];angle:string;word_count:number;schema:string;priority:string;intent:string},i:number)=>(
+                  {(monthData.posts||[]).map((post:{week:number;title:string;type:string;asset?:string;keywords:string[];angle:string;word_count:number;schema:string;priority:string;intent:string;funnel_stage?:string;gated?:boolean;cta?:string},i:number)=>(
                     <div key={i} style={{display:"grid",gridTemplateColumns:"48px 1fr",gap:12,padding:"14px 16px",background:S.subtle,borderRadius:10,border:`1px solid ${S.border}`}}>
                       <div style={{display:"flex",flexDirection:"column" as const,alignItems:"center",gap:3}}>
                         <div style={{width:36,height:36,borderRadius:8,background:"linear-gradient(135deg,#6366f1,#818cf8)",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:10,fontWeight:700}}>W{post.week}</div>
@@ -8173,8 +9383,12 @@ function EditorialCalendar({activeSite}:PageProps) {
                       <div>
                         <p style={{fontSize:13,fontWeight:700,color:S.text,margin:"0 0 4px"}}>{post.title}</p>
                         <p style={{fontSize:11,color:S.muted,margin:"0 0 6px",lineHeight:1.4}}>{post.angle}</p>
+                        {post.cta&&<p style={{fontSize:11,color:S.greenText,margin:"0 0 6px",lineHeight:1.4}}>→ CTA: {post.cta}</p>}
                         <div style={{display:"flex",gap:6,flexWrap:"wrap" as const}}>
-                          <span style={{fontSize:10,fontWeight:700,color:"#fff",background:typeColors[post.type]||S.muted,padding:"2px 8px",borderRadius:4}}>{post.type}</span>
+                          <span style={{fontSize:10,fontWeight:700,color:"#fff",background:typeColors[post.asset||post.type]||S.muted,padding:"2px 8px",borderRadius:4}}>{post.asset||post.type}</span>
+                          {post.asset&&post.type&&post.type!==post.asset&&<span style={{fontSize:10,fontWeight:600,color:S.muted,background:S.subtle,border:`1px solid ${S.border}`,padding:"2px 8px",borderRadius:4}}>{post.type}</span>}
+                          {post.gated&&<span style={{fontSize:10,fontWeight:700,color:"#fff",background:S.amber,padding:"2px 8px",borderRadius:4}}>🔒 gated</span>}
+                          {post.funnel_stage&&<span style={{fontSize:10,fontWeight:700,color:S.accentText,background:S.accentBg,border:"1px solid #c7d2fe",padding:"2px 8px",borderRadius:4}}>{post.funnel_stage}</span>}
                           <span style={{fontSize:10,fontWeight:700,color:intentColors[post.intent]||S.muted,background:S.subtle,border:`1px solid ${S.border}`,padding:"2px 8px",borderRadius:4}}>{post.intent}</span>
                           {post.schema!=="none"&&<span style={{fontSize:10,color:S.green,background:"#ecfdf5",border:"1px solid #a7f3d0",padding:"2px 8px",borderRadius:4}}>{post.schema}</span>}
                           <span style={{fontSize:10,color:S.muted,background:S.subtle,border:`1px solid ${S.border}`,padding:"2px 8px",borderRadius:4}}>{post.word_count} words</span>
@@ -8694,7 +9908,11 @@ function ContentSERP({activeSite,setActiveSite,setPage,gscDataMap={},ga4DataMap=
   const [intentFilter,setIntentFilter]=useState("All");
   const [sortKey,setSortKey]=useState<string>("");
   const [sortDir,setSortDir]=useState<"asc"|"desc">("desc");
+  // Row selection — keyed by keyword so picks survive re-sorting
+  const [picked,setPicked]=useState<Set<string>>(new Set());
   const hist = useToolHistory("serpcontent");
+
+  const togglePick = (kw:string) => setPicked(p=>{ const n=new Set(p); if(n.has(kw))n.delete(kw); else n.add(kw); return n; });
 
   const toggleSort = (key:string) => {
     if(sortKey===key){ setSortDir(d=>d==="asc"?"desc":"asc"); }
@@ -8823,6 +10041,8 @@ Base word count on SERP average ±10%. 6-8 outline sections derived from common 
   const diffColor=(d:string)=>d==="Low"?S.green:d==="Medium"?S.amber:S.red;
   const oppColor=(s:number)=>s>=60?S.green:s>=35?S.amber:S.red;
   const sel = selected!==null?results[selected]:null;
+  const pickedResults = results.filter(r=>picked.has(r.keyword));
+  const allPicked = results.length>0 && pickedResults.length===results.length;
 
   return (
     <div>
@@ -8902,17 +10122,27 @@ Base word count on SERP average ±10%. 6-8 outline sections derived from common 
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap" as const,gap:8}}>
               <SH title="SERP analysis results"/>
               <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                {picked.size>0 && <button onClick={()=>setPicked(new Set())} style={{fontSize:11,color:S.muted,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>Clear selection</button>}
                 <button onClick={()=>{
-                  const top=[...results].sort((a,b)=>(b.opportunity_score||0)-(a.opportunity_score||0)).slice(0,10);
+                  // Selected keywords win; otherwise fall back to the top 10 by opportunity
+                  const top = pickedResults.length>0
+                    ? pickedResults
+                    : [...results].sort((a,b)=>(b.opportunity_score||0)-(a.opportunity_score||0)).slice(0,10);
                   seedCampaign({items: top.map(r=>({keyword:r.keyword, wordCount:r.content_signals?.avg_word_count||undefined, difficulty:r.difficulty, opportunity:r.opportunity_score}))});
-                }} style={{fontSize:11,fontWeight:700,color:"#fff",background:"linear-gradient(135deg,#6366f1,#818cf8)",border:"none",borderRadius:6,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit"}}>🚀 Send top {Math.min(results.length,10)} to Campaign Agent →</button>
-                <button onClick={()=>downloadCSV("serp-analysis.csv",["Keyword","Your Rank","Difficulty","Opportunity","SERP Avg Words","Our Words","Top Domain","Content Gap"],results.map(r=>[r.keyword,r.your_rank?(r.your_rank.ranking?`#${r.your_rank.position}`:"Not ranking"):"—",r.difficulty,r.opportunity_score,r.content_signals?.avg_word_count||0,r.gap?.your_words??"—",r.serp_results?.[0]?.domain||"",r.gap?.word_gap>0?`+${r.gap.word_gap} words needed`:"—"]))} style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ Export CSV</button>
-                <button onClick={()=>{setResults([]);setKwInput("");}} style={{fontSize:11,color:S.muted,background:"none",border:`1px solid ${S.border}`,borderRadius:6,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit"}}>New analysis</button>
+                }} style={{fontSize:11,fontWeight:700,color:"#fff",background:"linear-gradient(135deg,#6366f1,#818cf8)",border:"none",borderRadius:6,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit"}}>🚀 Send {picked.size>0?`${picked.size} selected`:`top ${Math.min(results.length,10)}`} to Campaign Agent →</button>
+                <button onClick={()=>downloadCSV("serp-analysis.csv",["Keyword","Your Rank","Difficulty","Opportunity","SERP Avg Words","Our Words","Top Domain","Content Gap"],(pickedResults.length>0?pickedResults:results).map(r=>[r.keyword,r.your_rank?(r.your_rank.ranking?`#${r.your_rank.position}`:"Not ranking"):"—",r.difficulty,r.opportunity_score,r.content_signals?.avg_word_count||0,r.gap?.your_words??"—",r.serp_results?.[0]?.domain||"",r.gap?.word_gap>0?`+${r.gap.word_gap} words needed`:"—"]))} style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ Export CSV{picked.size>0?` (${picked.size})`:""}</button>
+                <button onClick={()=>{setResults([]);setKwInput("");setPicked(new Set());}} style={{fontSize:11,color:S.muted,background:"none",border:`1px solid ${S.border}`,borderRadius:6,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit"}}>New analysis</button>
               </div>
             </div>
             <div style={{overflowX:"auto"}}>
-              <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:680}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:13,minWidth:714}}>
                 <thead><tr>
+                  <th style={{padding:"10px 0 10px 14px",width:34,borderBottom:`1px solid ${S.border}`,background:"#f8fafc"}}>
+                    <input type="checkbox" aria-label="Select all keywords" checked={allPicked}
+                      ref={el=>{ if(el) el.indeterminate = picked.size>0 && !allPicked; }}
+                      onChange={()=>setPicked(allPicked?new Set():new Set(results.map(r=>r.keyword)))}
+                      style={{width:14,height:14,accentColor:S.accent,cursor:"pointer",display:"block"}}/>
+                  </th>
                   <SortTH label="Keyword" sk="keyword"/>
                   <SortTH label="Your Rank" sk="rank"/>
                   <SortTH label="Difficulty" sk="difficulty"/>
@@ -8922,10 +10152,17 @@ Base word count on SERP average ±10%. 6-8 outline sections derived from common 
                   <TH>Top Ranking</TH>
                   <SortTH label="Content Gap" sk="gap"/>
                 </tr></thead>
-                <tbody>{sortedResults.map((r,i)=>(
-                  <tr key={i} style={{cursor:"pointer"}} onClick={()=>{setSelected(results.indexOf(r));setBrief(null);}}
+                <tbody>{sortedResults.map((r,i)=>{
+                  const on = picked.has(r.keyword);
+                  const rest = on?S.accentBg:"transparent";
+                  return (
+                  <tr key={i} style={{cursor:"pointer",background:rest}} onClick={()=>{setSelected(results.indexOf(r));setBrief(null);}}
                     onMouseEnter={e=>(e.currentTarget as HTMLTableRowElement).style.background=S.subtle}
-                    onMouseLeave={e=>(e.currentTarget as HTMLTableRowElement).style.background="transparent"}>
+                    onMouseLeave={e=>(e.currentTarget as HTMLTableRowElement).style.background=rest}>
+                    <td onClick={e=>e.stopPropagation()} style={{padding:"11px 0 11px 14px",width:34,borderBottom:`1px solid ${S.border}`}}>
+                      <input type="checkbox" aria-label={`Select ${r.keyword}`} checked={on} onChange={()=>togglePick(r.keyword)}
+                        style={{width:14,height:14,accentColor:S.accent,cursor:"pointer",display:"block"}}/>
+                    </td>
                     <TD bold>{r.keyword}</TD>
                     <TD>{r.your_rank?(r.your_rank.ranking
                       ?<span style={{fontSize:11,fontWeight:700,color:r.your_rank.position<=3?S.green:r.your_rank.position<=10?S.accent:S.amber,background:r.your_rank.position<=3?S.greenBg:r.your_rank.position<=10?S.accentBg:S.amberBg,padding:"2px 8px",borderRadius:4}}>#{r.your_rank.position}</span>
@@ -8938,7 +10175,7 @@ Base word count on SERP average ±10%. 6-8 outline sections derived from common 
                     <TD><span style={{fontSize:11,color:S.accent}}>{r.serp_results?.[0]?.domain||"—"}</span></TD>
                     <TD>{r.gap?(r.gap.word_gap>0?<span style={{fontSize:11,color:S.amber,fontWeight:600}}>+{r.gap.word_gap.toLocaleString()} words <span style={{color:S.accent}}>→</span></span>:<span style={{fontSize:11,color:S.green}}>✓ on par <span style={{color:S.accent}}>→</span></span>):<span style={{fontSize:11,color:S.accent,fontWeight:600}}>View →</span>}</TD>
                   </tr>
-                ))}</tbody>
+                );})}</tbody>
               </table>
             </div>
           </Card>
@@ -9227,10 +10464,591 @@ function ClusterMap({suggestions}:{suggestions:any[]}) {
 }
 
 // ── SEO CAMPAIGN AGENT (PRD-aligned 7-phase pipeline with 2 approval gates) ──
+// ── Standalone article export ─────────────────────────────────────────────────
+// Wraps the generated body fragment in a full, publishable document using the
+// Compunnel editorial template (Brand Guidelines 2025): Lato throughout, masthead with
+// byline, answer + takeaways blocks, scroll-safe tables, sticky contents rail,
+// author block and a single JSON-LD @graph.
+const ART_ESC = (t: string) => String(t || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const ART_SLUG = (t: string) => String(t || "").toLowerCase().replace(/<[^>]+>/g, "").replace(/[^a-z0-9\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 50);
+
+const ARTICLE_CSS = `
+  :root{
+    --ink:#292929; --brand:#0050EF; --brand-deep:#0038AA;
+    --paper:#FFFFFF; --surface:#F5F5F5; --rule:#DFE3E5; --muted:#74767C;
+    --flag:#B4460A; --flag-soft:#FDF2EA; --measure:34rem;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:1.0625rem;line-height:1.65;font-optical-sizing:auto}
+  .wrap{max-width:1100px;margin:0 auto;padding:0 1.25rem}
+  .cols{display:grid;grid-template-columns:1fr;gap:2.5rem}
+  @media(min-width:1000px){.cols{grid-template-columns:minmax(0,1fr) 15rem;gap:3.5rem;align-items:start}.rail{position:sticky;top:1.5rem}}
+  article > *{max-width:var(--measure)}
+  article > .bleed, article > .tbl-scroll, article > figure.hero{max-width:none}
+  h1,h2,h3,h4{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;line-height:1.18;letter-spacing:-.014em;margin:0}
+  h1{font-size:clamp(2rem,5.2vw,2.9rem);font-weight:700;letter-spacing:-.026em}
+  h2{font-size:clamp(1.4rem,3vw,1.7rem);font-weight:650;margin:3.25rem 0 .85rem;padding-top:1.25rem;border-top:1px solid var(--rule)}
+  h3{font-size:1.115rem;font-weight:650;margin:2rem 0 .6rem}
+  h4{font-size:.95rem;font-weight:650;margin:0}
+  p{margin:0 0 1.1rem}
+  a{color:var(--brand-deep);text-underline-offset:.16em;text-decoration-thickness:.06em}
+  a:hover{color:var(--brand)}
+  strong{font-weight:600}
+  .lede{font-size:1.185rem;line-height:1.58}
+  .eyebrow{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.7rem;font-weight:500;letter-spacing:.13em;text-transform:uppercase;color:var(--muted)}
+  header.masthead{border-bottom:1px solid var(--rule);padding:2.5rem 0 1.75rem;margin-bottom:2.25rem}
+  .crumbs{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.78rem;color:var(--muted);margin-bottom:1.5rem}
+  .crumbs a{color:var(--muted);text-decoration:none}
+  .crumbs a:hover{color:var(--brand)}
+  .byline{display:flex;flex-wrap:wrap;gap:.4rem 1.25rem;align-items:baseline;margin-top:1.5rem;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.75rem;color:var(--muted)}
+  .byline b{color:var(--ink);font-weight:500}
+  figure.hero{margin:0 0 2rem}
+  figure.hero img{width:100%;height:auto;border-radius:10px;display:block}
+  .answer{background:var(--surface);border-left:3px solid var(--brand);padding:1.15rem 1.35rem;margin:0 0 1.5rem;border-radius:0 6px 6px 0}
+  .answer p:last-child{margin-bottom:0}
+  .takeaways{background:var(--surface);border-radius:8px;padding:1.4rem 1.5rem;margin:2rem 0}
+  .takeaways ul,.takeaways ul.tk-list{margin:.7rem 0 0;padding-left:1.1rem}
+  .takeaways li{margin-bottom:.55rem}
+  .takeaways li:last-child{margin-bottom:0}
+  .tbl-scroll{overflow-x:auto;margin:1.5rem 0;-webkit-overflow-scrolling:touch}
+  table{border-collapse:collapse;width:100%;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.875rem;line-height:1.45;min-width:520px}
+  caption{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);text-align:left;padding-bottom:.6rem}
+  th,td{padding:.7rem .8rem;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule)}
+  thead th{background:var(--surface);font-weight:650;font-size:.76rem;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--rule)}
+  tbody tr:last-child td{border-bottom:none}
+  td:first-child{font-weight:600}
+  .instrument{border:1px solid var(--rule);border-radius:10px;background:var(--paper);margin:2.25rem 0;overflow:hidden}
+  .instrument-head{padding:.85rem 1.15rem;border-bottom:1px solid var(--rule);background:var(--surface);display:flex;flex-wrap:wrap;gap:.35rem 1rem;align-items:baseline;justify-content:space-between}
+  .instrument-body{padding:1.25rem 1.15rem}
+  .instrument h4{font-size:.9rem}
+  .hint{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.68rem;color:var(--muted);letter-spacing:.04em}
+  .rail nav{border-left:2px solid var(--rule);padding-left:1rem}
+  .rail ol{list-style:none;margin:.75rem 0 0;padding:0;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.8rem;line-height:1.35}
+  .rail li{margin-bottom:.6rem}
+  .rail a{color:var(--muted);text-decoration:none;display:block}
+  .rail a:hover{color:var(--brand)}
+  ul.body-list,ol.body-list{padding-left:1.15rem;margin:0 0 1.25rem}
+  ul.body-list li,ol.body-list li{margin-bottom:.5rem}
+  .cta{border:1px solid var(--rule);border-left:3px solid var(--brand);border-radius:0 8px 8px 0;padding:1.3rem 1.4rem;margin:2rem 0;background:var(--surface)}
+  .cta p{margin-bottom:.9rem}
+  .btn{display:inline-block;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-weight:600;font-size:.88rem;background:var(--brand);color:#fff;padding:.7rem 1.15rem;border-radius:6px;text-decoration:none}
+  .btn:hover{background:var(--brand-deep);color:#fff}
+  .author{border-top:1px solid var(--rule);margin-top:3rem;padding-top:1.5rem;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.87rem;line-height:1.55}
+  .author .name{font-weight:700;font-size:1rem}
+  .author .role{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:.15rem 0 .7rem}
+  .sources{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.82rem;line-height:1.5;color:var(--muted)}
+  .sources li{margin-bottom:.4rem}
+  .note{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.83rem;color:var(--muted);line-height:1.55}
+  @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+`;
+
+// Rewrite the generated body fragment into the template's semantics.
+function styleArticleBody(html: string): { body: string; toc: { id: string; label: string }[] } {
+  let h = String(html || "");
+
+  // key-answer paragraph → bordered answer block
+  h = h.replace(/<p class=["']key-answer["']>([\s\S]*?)<\/p>/gi, (_m, inner) => `<div class="answer"><p>${inner}</p></div>`);
+
+  // "Key Takeaways" heading + list → single surfaced card with an eyebrow label
+  h = h.replace(/<h2[^>]*>\s*key takeaways\s*<\/h2>\s*<ul class=["']key-takeaways["']>([\s\S]*?)<\/ul>/gi,
+    (_m, items) => `<div class="takeaways"><div class="eyebrow">Key takeaways</div><ul class="tk-list">${items}</ul></div>`);
+  // …and the same list without the paired heading
+  h = h.replace(/<ul class=["']key-takeaways["']>([\s\S]*?)<\/ul>/gi,
+    (_m, items) => `<div class="takeaways"><div class="eyebrow">Key takeaways</div><ul class="tk-list">${items}</ul></div>`);
+
+  // The Sources list gets the muted reference styling
+  h = h.replace(/(<h2[^>]*>\s*sources\s*<\/h2>\s*)<ul>/gi, (_m, head) => `${head}<ul class="sources">`);
+
+  // Remaining body lists get the template's list rhythm
+  h = h.replace(/<(ul|ol)(?![^>]*class=)/gi, (_m, tag) => `<${tag} class="body-list"`);
+
+  // Every table becomes horizontally scrollable so it never breaks the page on mobile
+  h = h.replace(/<table(?![^>]*class=)([\s\S]*?)<\/table>/gi, (m) => `<div class="tbl-scroll">${m}</div>`);
+
+  // Give every H2 a stable id and collect the contents rail
+  const toc: { id: string; label: string }[] = [];
+  const used = new Set<string>();
+  h = h.replace(/<h2([^>]*)>([\s\S]*?)<\/h2>/gi, (_m, attrs, inner) => {
+    const label = String(inner).replace(/<[^>]+>/g, "").trim();
+    let id = ART_SLUG(label) || `section-${toc.length + 1}`;
+    while (used.has(id)) id = `${id}-${toc.length + 1}`;
+    used.add(id);
+    toc.push({ id, label });
+    const cleaned = String(attrs).replace(/\sid=["'][^"']*["']/i, "");
+    return `<h2${cleaned} id="${id}">${inner}</h2>`;
+  });
+
+  return { body: h, toc };
+}
+
+// ── Interactive rendering ─────────────────────────────────────────────────────
+// Turns validated instrument DATA into the reference template's markup. The
+// behaviour lives in RMI_RUNTIME below — one hand-written script shared by every
+// article. Model output only ever reaches the page as escaped text or JSON data.
+
+const RMI_CSS = `
+  .chips{display:flex;flex-wrap:wrap;gap:.45rem;margin-bottom:1.25rem}
+  .chip{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.82rem;font-weight:600;padding:.5rem .85rem;border:1px solid var(--rule);border-radius:999px;background:var(--paper);color:var(--muted);cursor:pointer;transition:.15s}
+  .chip:hover{border-color:var(--brand);color:var(--brand)}
+  .chip[aria-pressed="true"]{background:var(--brand);border-color:var(--brand);color:#fff}
+  .chip:focus-visible,.opt:focus-visible,.scen:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+  .readout{display:grid;grid-template-columns:1fr;gap:1.25rem}
+  @media(min-width:640px){.readout{grid-template-columns:minmax(0,10rem) minmax(0,1fr);gap:1.75rem}}
+  .figure{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-weight:600;font-size:3rem;line-height:1;color:var(--brand);letter-spacing:-.03em}
+  .figure-sub{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.72rem;color:var(--muted);margin-top:.45rem;line-height:1.4}
+  .facts{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.875rem;margin:0}
+  .facts dt{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.66rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.2rem}
+  .facts dd{margin:0 0 .85rem;line-height:1.5}
+  .facts dd:last-child{margin-bottom:0}
+  .scale{margin-top:1.35rem;padding-top:1.15rem;border-top:1px solid var(--rule)}
+  .track{position:relative;height:8px;background:var(--surface);border-radius:999px;margin:.9rem 0 .4rem}
+  .fill{position:absolute;left:0;top:0;bottom:0;background:var(--brand);border-radius:999px;transition:width .45s cubic-bezier(.4,0,.2,1)}
+  .ticks{display:flex;justify-content:space-between;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.65rem;color:var(--muted)}
+  .scen-grid{display:grid;grid-template-columns:1fr;gap:.5rem;margin-bottom:1.25rem}
+  @media(min-width:560px){.scen-grid{grid-template-columns:1fr 1fr}}
+  .scen{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.83rem;font-weight:600;text-align:left;line-height:1.35;padding:.7rem .85rem;border:1px solid var(--rule);border-radius:7px;background:var(--paper);color:var(--ink);cursor:pointer;transition:.15s}
+  .scen:hover{border-color:var(--brand)}
+  .scen[aria-pressed="true"]{border-color:var(--brand);background:var(--surface);box-shadow:inset 3px 0 0 var(--brand)}
+  .verdict{border-top:1px solid var(--rule);padding-top:1.15rem}
+  .vrow{display:grid;grid-template-columns:1fr;gap:.15rem;padding:.6rem 0;border-bottom:1px solid var(--rule);font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.86rem}
+  @media(min-width:560px){.vrow{grid-template-columns:11rem 1fr;gap:1rem;align-items:baseline}}
+  .vrow:last-child{border-bottom:none}
+  .vlabel{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.66rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+  .tag{display:inline-block;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.68rem;font-weight:600;padding:.12rem .45rem;border-radius:4px;letter-spacing:.03em}
+  .tag-y{background:#E6EEFE;color:var(--brand-deep)}
+  .tag-n{background:var(--surface);color:var(--muted)}
+  .tag-w{background:var(--flag-soft);color:var(--flag)}
+  .flagline{margin-top:1rem;padding:.75rem .9rem;background:var(--flag-soft);border-radius:6px;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.83rem;line-height:1.5;color:var(--flag)}
+  .q{padding:.9rem 0;border-bottom:1px solid var(--rule)}
+  .q:first-child{padding-top:0}
+  .q p{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.88rem;font-weight:600;margin:0 0 .6rem;line-height:1.4}
+  .opts{display:flex;flex-wrap:wrap;gap:.4rem}
+  .opt{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.78rem;font-weight:600;padding:.35rem .7rem;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--muted);cursor:pointer;transition:.15s}
+  .opt:hover{border-color:var(--brand);color:var(--brand)}
+  .opt[aria-pressed="true"]{background:var(--brand);border-color:var(--brand);color:#fff}
+  .result{margin-top:1.25rem;padding:1.15rem;background:var(--surface);border-radius:8px}
+  .result[hidden]{display:none}
+  .tier{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-weight:700;font-size:1.15rem;margin-bottom:.15rem}
+  .tier-meta{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.68rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin-bottom:.7rem}
+  .result ul{margin:.6rem 0 0;padding-left:1.1rem;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.86rem;line-height:1.5}
+  .result li{margin-bottom:.4rem}
+  .progress{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.68rem;color:var(--muted);margin-top:1rem}
+  .calc-row{display:grid;grid-template-columns:1fr;gap:.3rem;padding:.75rem 0;border-bottom:1px solid var(--rule)}
+  @media(min-width:560px){.calc-row{grid-template-columns:12rem 1fr auto;gap:1rem;align-items:center}}
+  .calc-row:first-child{padding-top:0}
+  .calc-label{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.86rem;font-weight:600}
+  .calc-row input[type=range]{width:100%;accent-color:var(--brand)}
+  .calc-val{font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.8rem;color:var(--muted);white-space:nowrap}
+  .calc-out{margin-top:1.25rem;padding-top:1.15rem;border-top:1px solid var(--rule)}
+`;
+
+// Behaviour for all four archetypes. No template literals or model-authored code.
+const RMI_RUNTIME = `
+(function(){
+  "use strict";
+  function esc(s){var d=document.createElement("span");d.textContent=String(s==null?"":s);return d.innerHTML;}
+  function data(root){
+    var tag=root.querySelector("script.rmi-data");
+    if(!tag) return null;
+    try{ return JSON.parse(tag.textContent); }catch(e){ return null; }
+  }
+  function press(list,i){
+    for(var k=0;k<list.length;k++) list[k].setAttribute("aria-pressed", k===i?"true":"false");
+  }
+
+  function dial(root,d){
+    var chips=root.querySelectorAll(".chip");
+    var fig=root.querySelector("[data-f]"), sub=root.querySelector("[data-s]");
+    var facts=root.querySelector("[data-facts]"), fill=root.querySelector("[data-fill]");
+    function show(i){
+      var o=d.options[i]; if(!o) return;
+      fig.textContent=o.figure; sub.textContent=o.sub;
+      var h=""; for(var k=0;k<o.facts.length;k++){ h+="<dt>"+esc(o.facts[k].label)+"</dt><dd>"+esc(o.facts[k].text)+"</dd>"; }
+      facts.innerHTML=h;
+      var max=d.scale&&d.scale.max?d.scale.max:100;
+      fill.style.width=Math.max(0,Math.min(100,(o.value/max)*100))+"%";
+      press(chips,i);
+    }
+    for(var i=0;i<chips.length;i++)(function(n){ chips[n].addEventListener("click",function(){show(n);}); })(i);
+    show(0);
+  }
+
+  function classifier(root,d){
+    var btns=root.querySelectorAll(".scen");
+    var cells=root.querySelectorAll("[data-v]");
+    var note=root.querySelector("[data-note]");
+    function show(i){
+      var s=d.scenarios[i]; if(!s) return;
+      for(var k=0;k<cells.length;k++){
+        var v=s.verdicts[k];
+        cells[k].innerHTML = v ? '<span class="tag tag-'+esc(v.state)+'">'+esc(v.text)+"</span>" : "";
+      }
+      note.textContent=s.note||""; note.style.display=s.note?"":"none";
+      press(btns,i);
+    }
+    for(var i=0;i<btns.length;i++)(function(n){ btns[n].addEventListener("click",function(){show(n);}); })(i);
+    show(0);
+  }
+
+  function assessment(root,d){
+    var host=root.querySelector("[data-qs]"), prog=root.querySelector("[data-progress]");
+    var res=root.querySelector("[data-result]");
+    var answers={}, total=d.questions.length;
+    var h="";
+    for(var i=0;i<total;i++){
+      h+='<div class="q"><p>'+esc(d.questions[i])+'</p><div class="opts" role="group" aria-label="Answer">'+
+         '<button class="opt" type="button" data-q="'+i+'" data-v="2">Yes</button>'+
+         '<button class="opt" type="button" data-q="'+i+'" data-v="1">Partly</button>'+
+         '<button class="opt" type="button" data-q="'+i+'" data-v="0">No</button></div></div>';
+    }
+    host.innerHTML=h;
+    prog.textContent="0 of "+total+" answered";
+    host.addEventListener("click",function(e){
+      var btn=e.target.closest?e.target.closest(".opt"):null;
+      if(!btn) return;
+      var q=btn.getAttribute("data-q");
+      answers[q]=parseInt(btn.getAttribute("data-v"),10);
+      var sibs=host.querySelectorAll('.opt[data-q="'+q+'"]');
+      for(var k=0;k<sibs.length;k++) sibs[k].setAttribute("aria-pressed", sibs[k]===btn?"true":"false");
+      var keys=Object.keys(answers);
+      prog.textContent=keys.length+" of "+total+" answered";
+      if(keys.length<total) return;
+      var score=0; for(var j=0;j<keys.length;j++) score+=answers[keys[j]];
+      var tier=null;
+      for(var t=0;t<d.tiers.length;t++){ if(score>=d.tiers[t].min&&score<=d.tiers[t].max){ tier=d.tiers[t]; break; } }
+      if(!tier) tier=d.tiers[d.tiers.length-1];
+      var steps=""; for(var sIdx=0;sIdx<tier.steps.length;sIdx++) steps+="<li>"+esc(tier.steps[sIdx])+"</li>";
+      res.innerHTML='<div class="tier">'+esc(tier.name)+'</div><div class="tier-meta">Score '+score+" of "+(total*2)+'</div>'+
+        '<p style="font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:.88rem;margin:0">'+esc(tier.desc)+"</p>"+
+        '<div class="eyebrow" style="margin-top:1rem">Where to focus next</div><ul>'+steps+"</ul>";
+      res.hidden=false;
+    });
+  }
+
+  function calculator(root,d){
+    var rows=root.querySelectorAll("[data-calc]");
+    var out=root.querySelector("[data-result]");
+    function recalc(){
+      var sum=Number(d.base)||0;
+      for(var i=0;i<rows.length;i++){
+        var v=Number(rows[i].value)||0;
+        sum+=v*(Number(d.inputs[i].coefficient)||0);
+        var lbl=rows[i].parentNode.querySelector("[data-o]");
+        if(lbl) lbl.textContent=v.toLocaleString()+(d.inputs[i].unit?" "+d.inputs[i].unit:"");
+      }
+      var dec=Number(d.output.decimals)||0;
+      out.textContent=(d.output.prefix||"")+sum.toLocaleString(undefined,{minimumFractionDigits:dec,maximumFractionDigits:dec})+(d.output.suffix||"");
+    }
+    for(var i=0;i<rows.length;i++) rows[i].addEventListener("input",recalc);
+    recalc();
+  }
+
+  var KIND={dial:dial,classifier:classifier,assessment:assessment,calculator:calculator};
+  var nodes=document.querySelectorAll("[data-rmi]");
+  for(var i=0;i<nodes.length;i++){
+    var root=nodes[i], d=data(root), fn=KIND[root.getAttribute("data-rmi")];
+    if(d&&fn){ try{ fn(root,d); }catch(e){ root.style.display="none"; } }
+    else { root.style.display="none"; }
+  }
+})();
+`;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function renderInteractive(inst: any): string {
+  const E = ART_ESC;
+  // JSON rides along in a data island; "<" is escaped so it can never close the script early.
+  const payload = JSON.stringify(inst).replace(/</g, "\\u003c");
+  const shell = (bodyHtml: string) =>
+    `<div class="instrument bleed" id="${E(inst.id)}" data-rmi="${E(inst.kind)}">` +
+    `<div class="instrument-head"><h4>${E(inst.title)}</h4><span class="hint">${E(inst.hint)}</span></div>` +
+    `<div class="instrument-body">${bodyHtml}</div>` +
+    `<script type="application/json" class="rmi-data">${payload}<\/script>` +
+    `</div>`;
+
+  if (inst.kind === "dial") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const chips = inst.options.map((o: any, i: number) =>
+      `<button class="chip" type="button" data-i="${i}" aria-pressed="${i === 0 ? "true" : "false"}">${E(o.label)}</button>`).join("");
+    return shell(
+      `<div class="chips" role="group" aria-label="${E(inst.title)}">${chips}</div>` +
+      `<div class="readout"><div><div class="figure" data-f></div><div class="figure-sub" data-s></div></div><dl class="facts" data-facts></dl></div>` +
+      `<div class="scale"><div class="eyebrow">Where this sits on the range</div>` +
+      `<div class="track"><div class="fill" data-fill style="width:0"></div></div>` +
+      `<div class="ticks"><span>0</span><span>${E(inst.scale.unit || "")}</span><span>${E(String(inst.scale.max))}</span></div></div>`);
+  }
+
+  if (inst.kind === "classifier") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const scens = inst.scenarios.map((s: any, i: number) =>
+      `<button class="scen" type="button" data-i="${i}" aria-pressed="${i === 0 ? "true" : "false"}">${E(s.label)}</button>`).join("");
+    const rows = inst.rows.map((r: string, i: number) =>
+      `<div class="vrow"><span class="vlabel">${E(r)}</span><span data-v="${i}"></span></div>`).join("");
+    return shell(
+      `<div class="scen-grid" role="group" aria-label="${E(inst.title)}">${scens}</div>` +
+      `<div class="verdict">${rows}<div class="flagline" data-note></div></div>`);
+  }
+
+  if (inst.kind === "assessment") {
+    return shell(
+      `<div data-qs></div><div class="progress" data-progress></div>` +
+      `<div class="result" data-result hidden></div>`);
+  }
+
+  if (inst.kind === "calculator") {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rows = inst.inputs.map((n: any, i: number) =>
+      `<label class="calc-row"><span class="calc-label">${E(n.label)}</span>` +
+      `<input type="range" data-calc="${i}" min="${n.min}" max="${n.max}" value="${n.default}" aria-label="${E(n.label)}">` +
+      `<span class="calc-val" data-o></span></label>`).join("");
+    return shell(
+      rows +
+      `<div class="calc-out"><div class="figure" data-result></div><div class="figure-sub">${E(inst.output.label)}</div></div>` +
+      (inst.note ? `<p class="note" style="margin-top:1rem">${E(inst.note)}</p>` : ""));
+  }
+
+  return "";
+}
+
+// Drop each instrument at the end of the section named by after_heading. Anything that
+// does not match a real heading is appended before Sources rather than silently lost.
+// ── WordPress-safe article markup ─────────────────────────────────────────────
+// Two things a table-of-contents needs, both of which raw styled HTML fails to provide:
+//
+//  1. ANCHOR IDS. A TOC links to #section; headings published without an id give it
+//     nothing to point at, so many plugins skip them entirely.
+//  2. REAL GUTENBERG BLOCKS. Posting raw HTML through the REST API stores the whole
+//     article as ONE "classic" block. Block-aware TOCs (the core Table of Contents
+//     block, and block themes) enumerate heading BLOCKS — and find zero.
+//
+// So headings/paragraphs/lists are emitted as core blocks (no inline styles, so they
+// validate cleanly in the editor and the theme owns typography), while the custom
+// components the theme knows nothing about — answer block, takeaways, tables, CTA —
+// go in <!-- wp:html --> blocks, which Gutenberg does not validate and wp_kses_post
+// still allows the style attribute through.
+const WP = {
+  ink: "#292929", brand: "#0050EF", brandDeep: "#0038AA",
+  surface: "#F5F5F5", rule: "#DFE3E5", muted: "#74767C",
+};
+const WP_SANS = "Lato,'Helvetica Neue',Helvetica,Arial,sans-serif";
+
+const wpSlug = (t: string) => String(t || "").toLowerCase().replace(/<[^>]+>/g, "")
+  .replace(/&[a-z#0-9]+;/gi, " ").replace(/[^a-z0-9\s-]/g, "").trim()
+  .replace(/\s+/g, "-").replace(/-+/g, "-").slice(0, 60);
+
+const wpHtmlBlock = (inner: string) => `<!-- wp:html -->\n${inner}\n<!-- /wp:html -->`;
+
+function wpArticleHtml(html: string): string {
+  let h = String(html || "");
+  // Custom components are lifted out first so the block-wrapping passes below can never
+  // reach inside them and wrap their internals a second time.
+  const held: string[] = [];
+  const hold = (markup: string) => { held.push(markup); return ` HOLD${held.length - 1} `; };
+
+  // ── Direct-answer block ──
+  h = h.replace(/<p class=["']key-answer["']>([\s\S]*?)<\/p>/gi, (_m, inner) =>
+    hold(wpHtmlBlock(`<div style="background:${WP.surface};border-left:4px solid ${WP.brand};padding:18px 22px;margin:0 0 26px;border-radius:0 6px 6px 0">` +
+      `<p style="margin:0;font-family:${WP_SANS};font-size:17px;line-height:1.6;color:${WP.ink}"><strong>${inner}</strong></p></div>`)));
+
+  // ── Key Takeaways card (the heading is absorbed into the card) ──
+  const takeaways = (items: string) => hold(wpHtmlBlock(
+    `<div style="background:${WP.surface};border-radius:8px;padding:22px 24px;margin:32px 0">` +
+    `<p style="margin:0 0 10px;font-family:${WP_SANS};font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:${WP.muted}">Key takeaways</p>` +
+    `<ul style="margin:0;padding-left:20px;font-family:${WP_SANS}">${items.replace(/<li(\s[^>]*)?>/gi, `<li style="margin-bottom:9px;line-height:1.6">`)}</ul></div>`));
+  h = h.replace(/<h2[^>]*>\s*key takeaways\s*<\/h2>\s*<ul class=["']key-takeaways["']>([\s\S]*?)<\/ul>/gi, (_m, items) => takeaways(items));
+  h = h.replace(/<ul class=["']key-takeaways["']>([\s\S]*?)<\/ul>/gi, (_m, items) => takeaways(items));
+
+  // ── Tables ──
+  h = h.replace(/<table([\s\S]*?)<\/table>/gi, (m) => {
+    const t = m
+      .replace(/<table([^>]*)>/i, `<table style="border-collapse:collapse;width:100%;min-width:520px;font-family:${WP_SANS};font-size:15px;line-height:1.45">`)
+      .replace(/<th(\s[^>]*)?>/gi, `<th style="padding:11px 13px;text-align:left;vertical-align:top;background:${WP.surface};font-weight:700;font-size:13px;letter-spacing:.03em;text-transform:uppercase;color:${WP.muted};border-bottom:1px solid ${WP.rule}">`)
+      .replace(/<td(\s[^>]*)?>/gi, `<td style="padding:11px 13px;text-align:left;vertical-align:top;border-bottom:1px solid ${WP.rule}">`);
+    return hold(wpHtmlBlock(`<div style="overflow-x:auto;margin:26px 0;-webkit-overflow-scrolling:touch">${t}</div>`));
+  });
+
+  // ── CTA ──
+  h = h.replace(/<div class=["']cta["'][^>]*>([\s\S]*?)<\/div>/gi, (_m, inner) =>
+    hold(wpHtmlBlock(`<div style="border:1px solid ${WP.rule};border-left:4px solid ${WP.brand};border-radius:0 8px 8px 0;padding:22px 24px;margin:32px 0;background:${WP.surface};font-family:${WP_SANS}">${inner}</div>`)));
+
+  // ── Headings → core blocks WITH anchor ids (this is what a TOC reads) ──
+  const used = new Set<string>();
+  const headingBlock = (level: 2 | 3) => (_m: string, inner: string) => {
+    const text = String(inner).replace(/<[^>]+>/g, "").trim();
+    let id = wpSlug(text) || `section-${used.size + 1}`;
+    while (used.has(id)) id = `${id}-${used.size + 1}`;
+    used.add(id);
+    return `<!-- wp:heading {"level":${level},"anchor":"${id}"} -->\n<h${level} class="wp-block-heading" id="${id}">${inner}</h${level}>\n<!-- /wp:heading -->`;
+  };
+  h = h.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, headingBlock(2));
+  h = h.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, headingBlock(3));
+
+  // ── Paragraphs and lists → core blocks (no inline styles, so they validate) ──
+  h = h.replace(/<p(?:\s[^>]*)?>([\s\S]*?)<\/p>/gi, (_m, inner) =>
+    `<!-- wp:paragraph -->\n<p>${inner}</p>\n<!-- /wp:paragraph -->`);
+  h = h.replace(/<(ul|ol)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/gi, (_m, tag, inner) => {
+    const items = String(inner).replace(/<li(?:\s[^>]*)?>/gi, "<li>");
+    const ordered = tag.toLowerCase() === "ol";
+    return `<!-- wp:list${ordered ? ' {"ordered":true}' : ""} -->\n<${tag} class="wp-block-list">${items}</${tag}>\n<!-- /wp:list -->`;
+  });
+
+  // Restore the held components
+  h = h.replace(/ HOLD(\d+) /g, (_m, i) => held[Number(i)] ?? "");
+  return h;
+}
+
+// One standalone, self-contained page per widget. Used both for the in-app iframe preview
+// and for the hosted embed that WordPress loads, so the two can never drift apart.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function widgetDoc(inst: any): string {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">`
+    + `<style>${ARTICLE_CSS}${RMI_CSS}html,body{margin:0;padding:0;background:transparent}`
+    + `.instrument{margin:0;border-radius:10px}</style></head><body>`
+    + renderInteractive(inst)
+    + `<script>${RMI_RUNTIME}<\/script></body></html>`;
+}
+
+// Fallback heights per archetype. A cross-origin iframe cannot resize itself without a
+// listener on the host page, and WordPress will not have one — so each kind gets a height
+// that fits its tallest realistic state and the widget scrolls internally if it overflows.
+const WIDGET_H: Record<string, number> = { dial: 430, classifier: 540, assessment: 580, calculator: 400 };
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function insertInteractives(body: string, interactives: any[]): string {
+  if (!Array.isArray(interactives) || !interactives.length) return body;
+  let out = body;
+  const leftovers: string[] = [];
+
+  interactives.forEach(inst => {
+    // Callers either pass instrument data (rendered inline here, for the HTML export) or a
+    // pre-built __html embed (the hosted iframe used for WordPress). Placement is identical.
+    const html = inst.__html || renderInteractive(inst);
+    if (!html) return;
+    const want = String(inst.after_heading || "").replace(/<[^>]+>/g, "").trim().toLowerCase();
+    let placed = false;
+    if (want) {
+      // Find the target H2, then walk to the next H2 (or the end) and insert there.
+      const heads = [...out.matchAll(/<h2[^>]*>([\s\S]*?)<\/h2>/gi)];
+      const hit = heads.find(m => m[1].replace(/<[^>]+>/g, "").trim().toLowerCase() === want);
+      if (hit && hit.index !== undefined) {
+        const after = hit.index + hit[0].length;
+        // Land BEFORE the next heading's opening block comment. Searching for "<h2" alone
+        // would insert between "<!-- wp:heading -->" and its <h2>, splitting that block.
+        const next = out.slice(after).search(/<!-- wp:heading|<h2[^>]*>/i);
+        const at = next === -1 ? out.length : after + next;
+        out = out.slice(0, at) + "\n" + html + "\n" + out.slice(at);
+        placed = true;
+      }
+    }
+    if (!placed) leftovers.push(html);
+  });
+
+  if (leftovers.length) {
+    const srcIdx = out.search(/<h2[^>]*>\s*sources\s*<\/h2>/i);
+    const block = "\n" + leftovers.join("\n") + "\n";
+    out = srcIdx === -1 ? out + block : out.slice(0, srcIdx) + block + out.slice(srcIdx);
+  }
+  return out;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function standaloneArticleHtml(c: any, opts: { domain: string; category?: string; authName?: string; authTitle?: string; authUrl?: string; authBio?: string }): string {
+  const host = String(opts.domain || "").replace(/^https?:\/\//, "").replace(/\/$/, "");
+  const site = host ? `https://${host}` : "";
+  const brand = host ? host.replace(/^www\./, "").split(".")[0].replace(/^\w/, ch => ch.toUpperCase()) : "";
+  const interactives = Array.isArray(c.interactives) ? c.interactives : [];
+  const { body: styledBody, toc } = styleArticleBody(c.article_html || "");
+  const body = insertInteractives(styledBody, interactives);
+
+  const title = String(c.title || c.meta_title || "Untitled");
+  const words = Number(c.word_count) || String(c.article_html || "").replace(/<[^>]+>/g, " ").split(/\s+/).filter(Boolean).length;
+  const readMin = Math.max(1, Math.round(words / 220));
+  const today = new Date();
+  const dateLabel = `${today.getDate()} ${["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"][today.getMonth()]} ${today.getFullYear()}`;
+  const canonical = site && c.slug ? `${site}/${c.slug}/` : site;
+
+  // One @graph rather than several loose script tags — matches the reference document.
+  const graph: unknown[] = [];
+  [c.schema_article, c.schema_faq, c.schema_breadcrumb, c.schema_extra].forEach(s => {
+    if (!s) return;
+    try { const o = JSON.parse(String(s)); if (Array.isArray(o)) graph.push(...o); else graph.push(o); } catch { /* skip unparseable schema */ }
+  });
+  if (graph.length && opts.authName) {
+    // Promote the configured byline to the Person author on the article node (E-E-A-T)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    graph.forEach((node: any) => {
+      if (node && /Posting|Article/i.test(String(node["@type"] || ""))) {
+        node.author = { "@type": "Person", name: opts.authName, ...(opts.authTitle ? { jobTitle: opts.authTitle } : {}), ...(opts.authUrl ? { url: opts.authUrl } : {}) };
+      }
+    });
+  }
+  const schemaBlock = graph.length
+    ? `\n<script type="application/ld+json">\n${JSON.stringify({ "@context": "https://schema.org", "@graph": graph }, null, 2)}\n<\/script>\n`
+    : "";
+
+  const crumbs = site
+    ? `<div class="crumbs"><a href="${ART_ESC(site)}/">Home</a> &rsaquo; <a href="${ART_ESC(site)}/blog/">Blog</a> &rsaquo; ${ART_ESC(title)}</div>`
+    : "";
+
+  const hero = c.hero_image
+    ? `<figure class="hero"><img src="${ART_ESC(c.hero_image)}" alt="${ART_ESC(c.hero_alt || title)}"></figure>`
+    : "";
+
+  const rail = toc.length >= 3
+    ? `<aside class="rail"><nav aria-label="Contents"><div class="eyebrow">Contents</div><ol>${toc.map(t => `<li><a href="#${t.id}">${ART_ESC(t.label)}</a></li>`).join("")}</ol></nav></aside>`
+    : "";
+
+  const authorBlock = opts.authName
+    ? `<div class="author"><div class="name">${ART_ESC(opts.authName)}</div>${opts.authTitle ? `<div class="role">${ART_ESC(opts.authTitle)}${brand ? `, ${ART_ESC(brand)}` : ""}</div>` : ""}${opts.authBio ? `<p style="margin:0">${ART_ESC(opts.authBio)}${opts.authUrl ? ` <a href="${ART_ESC(opts.authUrl)}" rel="author nofollow">More about ${ART_ESC(opts.authName)}</a>` : ""}</p>` : ""}</div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${ART_ESC(c.meta_title || title)}${brand ? ` | ${ART_ESC(brand)}` : ""}</title>
+<meta name="description" content="${ART_ESC(c.meta_description || "")}">
+${canonical ? `<link rel="canonical" href="${ART_ESC(canonical)}">` : ""}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lato:ital,wght@0,300;0,400;0,700;0,900;1,400&display=swap" rel="stylesheet">
+${schemaBlock}<style>${ARTICLE_CSS}${interactives.length ? RMI_CSS : ""}</style>
+</head>
+<body>
+
+<div class="wrap">
+<header class="masthead">
+  ${crumbs}
+  ${opts.category ? `<div class="eyebrow">${ART_ESC(opts.category)}</div>` : ""}
+  <h1 style="margin-top:.6rem">${ART_ESC(title)}</h1>
+  <div class="byline">
+    ${opts.authName ? `<span>By <b>${ART_ESC(opts.authName)}</b>${opts.authTitle ? `, ${ART_ESC(opts.authTitle)}` : ""}${brand ? `, ${ART_ESC(brand)}` : ""}</span>` : ""}
+    <span>Last updated <b>${dateLabel}</b></span>
+    <span><b>${readMin}</b> min read</span>
+  </div>
+</header>
+
+<div class="cols">
+<article>
+${hero}
+${body}
+${authorBlock}
+</article>
+${rail}
+</div>
+</div>
+${interactives.length ? `<script>${RMI_RUNTIME}<\/script>` : ""}
+</body>
+</html>`;
+}
+
 function SEOCampaign({activeSite,setPage}:PageProps) {
   const [gtm,setGtm]=useState("");
   const [brief,setBrief]=useState("");
-  const [guardrails,setGuardrails]=useState("");
+  // Listing ("Top N …") article mode — replaces the old guardrails box.
+  const [listCount,setListCount]=useState("5");
+  const [listSubject,setListSubject]=useState("");
   const [domain,setDomain]=useState(activeSite?activeSite.replace(/^https?:\/\//,"").replace(/\/$/,""):"");
   const [seededKw,setSeededKw]=useState("");
   // Handoff → pre-fill domain + a starter brief. Two sources:
@@ -9334,6 +11152,20 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
   const [content,setContent]=useState<Record<number,any>>({});
   const [genProgress,setGenProgress]=useState({done:0,total:0});
   const [contentLength,setContentLength]=useState("auto"); // auto = per-suggestion word_count
+  // Interactive previews live in sandboxed iframes; they post their height back so each
+  // frame can be sized to its content instead of scrolling inside a fixed box.
+  const [iframeH,setIframeH]=useState<Record<string,number>>({});
+  useEffect(()=>{
+    const onMsg=(e:MessageEvent)=>{
+      const d=e.data as {rmiH?:number;rmiK?:string};
+      if(!d||typeof d.rmiH!=="number"||typeof d.rmiK!=="string")return;
+      const h=Math.max(140,Math.min(900,Math.ceil(d.rmiH)+8));
+      const k=d.rmiK;
+      setIframeH(prev=>prev[k]===h?prev:{...prev,[k]:h});
+    };
+    window.addEventListener("message",onMsg);
+    return ()=>window.removeEventListener("message",onMsg);
+  },[]);
   // WordPress batch publish (credentials shared with SEO Content Agent via localStorage)
   const [wpUrl,setWpUrlRaw]=useState(()=>{try{return localStorage.getItem("rm_wp_url")||"";}catch{return "";}});
   const [wpUser,setWpUserRaw]=useState(()=>{try{return localStorage.getItem("rm_wp_user")||"";}catch{return "";}});
@@ -9342,6 +11174,11 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
   const setWpUser=(v:string)=>{setWpUserRaw(v);try{localStorage.setItem("rm_wp_user",v);}catch{}};
   const setWpPass=(v:string)=>{setWpPassRaw(v);try{localStorage.setItem("rm_wp_pass",v);}catch{}};
   const [wpStatus,setWpStatus]=useState<"draft"|"publish">("draft");
+  // Where articles land in WordPress. Defaults to Posts — blog content belongs in the blog.
+  // "auto" is kept for the occasional landing page, but is no longer the default because it
+  // silently routed anything typed "pillar" to Pages.
+  const [wpPostType,setWpPostTypeRaw]=useState<"posts"|"pages"|"auto">(()=>{try{return (localStorage.getItem("rm_wp_posttype") as "posts"|"pages"|"auto")||"posts";}catch{return "posts";}});
+  const setWpPostType=(v:"posts"|"pages"|"auto")=>{setWpPostTypeRaw(v);try{localStorage.setItem("rm_wp_posttype",v);}catch{}};
   // WordPress categories — cached PER PROJECT so they persist across refreshes (no re-fetching)
   const projKey=(domain||activeSite||"_").replace(/^https?:\/\//,"").replace(/\/$/,"").toLowerCase();
   const catCacheKey=`rm_wp_cats_${projKey}`;
@@ -9367,10 +11204,12 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
   const [authTitle,setAuthTitleRaw]=useState(()=>{try{return localStorage.getItem("rm_wp_auth_title")||"";}catch{return "";}});
   const [authUrl,setAuthUrlRaw]=useState(()=>{try{return localStorage.getItem("rm_wp_auth_url")||"";}catch{return "";}});
   const [authBio,setAuthBioRaw]=useState(()=>{try{return localStorage.getItem("rm_wp_auth_bio")||"";}catch{return "";}});
+  const [authAvatar,setAuthAvatarRaw]=useState(()=>{try{return localStorage.getItem("rm_wp_auth_avatar")||"";}catch{return "";}});
   const setAuthName=(v:string)=>{setAuthNameRaw(v);try{localStorage.setItem("rm_wp_auth_name",v);}catch{}};
   const setAuthTitle=(v:string)=>{setAuthTitleRaw(v);try{localStorage.setItem("rm_wp_auth_title",v);}catch{}};
   const setAuthUrl=(v:string)=>{setAuthUrlRaw(v);try{localStorage.setItem("rm_wp_auth_url",v);}catch{}};
   const setAuthBio=(v:string)=>{setAuthBioRaw(v);try{localStorage.setItem("rm_wp_auth_bio",v);}catch{}};
+  const setAuthAvatar=(v:string)=>{setAuthAvatarRaw(v);try{localStorage.setItem("rm_wp_auth_avatar",v);}catch{}};
   // When the author name matches the curated Compunnel roster, auto-fill the canonical
   // LinkedIn, bio, and title for E-E-A-T (only fills empty fields — never overwrites).
   useEffect(()=>{
@@ -9399,7 +11238,7 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
   const pickAuthor=(id:number)=>{
     setAuthId(id);try{localStorage.setItem("rm_wp_auth_id",String(id));}catch{}
     const a=wpAuthors.find(x=>x.id===id);
-    if(a){ setAuthName(a.name||""); setAuthBio(a.bio||""); if(a.url)setAuthUrl(a.url); }
+    if(a){ setAuthName(a.name||""); setAuthBio(a.bio||""); if(a.url)setAuthUrl(a.url); if(a.avatar)setAuthAvatar(a.avatar); }
   };
   // Combined author picker: WordPress users (value "wp:<id>") + curated Compunnel roster
   // (value "roster:<name>"). Roster picks set authId=0 → matched to a WP user by name on publish.
@@ -9453,16 +11292,60 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
     const results:{title:string;ok:boolean;link?:string;error?:string}[]=[];
     // Author profile for E-E-A-T: a Person object for schema + an on-page byline/bio box
     const esc=(t:string)=>t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-    const authorPerson=authName.trim()?{"@type":"Person",name:authName.trim(),...(authTitle.trim()?{jobTitle:authTitle.trim()}:{}),...(authBio.trim()?{description:authBio.trim()}:{}),...(authUrl.trim()?{url:authUrl.trim(),sameAs:[authUrl.trim()]}:{})}:null;
-    const authorBox=authName.trim()?`\n<div class="author-bio" style="margin-top:32px;padding:16px;border-top:2px solid #eee;display:flex;gap:12px;align-items:flex-start"><div><p style="margin:0;font-weight:700">${esc(authName.trim())}${authTitle.trim()?` — ${esc(authTitle.trim())}`:""}</p>${authBio.trim()?`<p style="margin:4px 0 0;font-size:14px;color:#555">${esc(authBio.trim())}</p>`:""}${authUrl.trim()?`<p style="margin:6px 0 0;font-size:13px"><a href="${esc(authUrl.trim())}" rel="author noopener" target="_blank">More about ${esc(authName.trim())}</a></p>`:""}</div></div>`:"";
+    const authorPerson=authName.trim()?{"@type":"Person",name:authName.trim(),...(authTitle.trim()?{jobTitle:authTitle.trim()}:{}),...(authBio.trim()?{description:authBio.trim()}:{}),...(authUrl.trim()?{url:authUrl.trim(),sameAs:[authUrl.trim()]}:{}),...(authAvatar.trim()?{image:authAvatar.trim()}:{})}:null;
+    // Author box: circular avatar, name with a LinkedIn badge, then the bio. All styling is
+    // inline because wp_kses_post strips <style>; the badge is a styled <a>, not an <svg>,
+    // since kses removes SVG entirely. Avatar is optional — the block reflows without it.
+    const av=authAvatar.trim();
+    const liBadge=authUrl.trim()
+      ? `<a href="${esc(authUrl.trim())}" target="_blank" rel="author noopener nofollow" title="${esc(authName.trim())} on LinkedIn" style="display:inline-block;width:19px;height:19px;line-height:19px;margin-left:8px;background:#0A66C2;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:11px;font-weight:700;text-align:center;border-radius:4px;text-decoration:none;vertical-align:middle">in</a>`
+      : "";
+    const authorBox=authName.trim()?`
+<!-- wp:html -->
+<div class="author-bio" style="margin-top:44px;padding-top:28px;border-top:1px solid #D8E0F0;display:flex;gap:20px;align-items:flex-start">`
+      + (av?`<img src="${esc(av)}" alt="${esc(authName.trim())}" width="96" height="96" loading="lazy" style="width:96px;height:96px;min-width:96px;border-radius:50%;object-fit:cover;display:block">`:"")
+      + `<div style="flex:1;min-width:0">`
+      + `<p style="margin:0 0 6px;font-family:Lato,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:21px;font-weight:700;line-height:1.2;color:#0B1220">${esc(authName.trim())}${liBadge}</p>`
+      + (authTitle.trim()?`<p style="margin:0 0 8px;font-family:Lato,'Helvetica Neue',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#5A6782">${esc(authTitle.trim())}</p>`:"")
+      + (authBio.trim()?`<p style="margin:0;font-size:16px;line-height:1.6;color:#0B1220">${esc(authBio.trim())}</p>`:"")
+      + `</div></div>
+<!-- /wp:html -->`:"";
     for(let k=0;k<idxs.length;k++){
       const i=idxs[k];const c=content[i];const sug=suggestions[i];
       // Inject the Person author into the Article schema (replaces the Organization-only author)
       let schemaArticle=c.schema_article||"";
       if(authorPerson&&schemaArticle){ try{ const o=JSON.parse(schemaArticle); o.author=authorPerson; schemaArticle=JSON.stringify(o); }catch{} }
-      const fullHtml=`${c.article_html||""}${authorBox}${schemaArticle?`\n<script type="application/ld+json">${schemaArticle}</script>`:""}${c.schema_faq?`\n<script type="application/ld+json">${c.schema_faq}</script>`:""}${c.schema_breadcrumb?`\n<script type="application/ld+json">${c.schema_breadcrumb}</script>`:""}${c.schema_extra?`\n<script type="application/ld+json">${c.schema_extra}</script>`:""}`;
+      // Interactives ship as HOSTED IFRAMES, not inline script. WordPress runs wp_kses_post
+      // on REST-published content and strips <script>/<style> for any user without
+      // unfiltered_html (and most security plugins strip it regardless), which would leave
+      // dead widgets on the published page. An <iframe src> carries no inline JS to sanitize.
+      const rmi=Array.isArray(c.interactives)?c.interactives:[];
+      // Inline the editorial design BEFORE placing widgets, so the styling pass never
+      // rewrites the iframe embeds it would otherwise treat as ordinary markup.
+      let bodyHtml=wpArticleHtml(c.article_html||"");
+      if(rmi.length){
+        const hosted=await Promise.all(rmi.map(async(inst:{kind:string;title?:string;after_heading?:string})=>{
+          try{
+            const rr=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},
+              body:JSON.stringify({tool:"widget_save",html:widgetDoc(inst)})});
+            const dd=await rr.json();
+            if(!dd.path) return null;
+            const h=WIDGET_H[inst.kind]||460;
+            const t=(inst.title||"Interactive").replace(/"/g,"&quot;");
+            // Wrapped as a wp:html block so it slots into the block structure the rest of
+            // the body now uses, instead of landing as stray HTML between blocks.
+            return {after_heading:inst.after_heading,
+              __html:`<!-- wp:html -->\n<iframe src="${window.location.origin}${dd.path}" title="${t}" width="100%" height="${h}" loading="lazy" scrolling="no" style="width:100%;max-width:100%;border:0;display:block;margin:24px 0"></iframe>\n<!-- /wp:html -->`};
+          }catch{ return null; }
+        }));
+        const ok=hosted.filter(Boolean) as {after_heading?:string;__html:string}[];
+        if(ok.length) bodyHtml=insertInteractives(bodyHtml,ok);
+      }
+      const fullHtml=`${bodyHtml}${authorBox}${schemaArticle?`\n<script type="application/ld+json">${schemaArticle}</script>`:""}${c.schema_faq?`\n<script type="application/ld+json">${c.schema_faq}</script>`:""}${c.schema_breadcrumb?`\n<script type="application/ld+json">${c.schema_breadcrumb}</script>`:""}${c.schema_extra?`\n<script type="application/ld+json">${c.schema_extra}</script>`:""}`;
       const heroImage=c.hero_b64?{b64:c.hero_b64,mime:c.hero_mime,alt:c.hero_alt||c.title}:undefined;
-      const endpoint=(sug?.content_type||"").toLowerCase().includes("landing")||(sug?.content_type||"").toLowerCase().includes("pillar")?"pages":"posts";
+      // A pillar article is still a blog article — only an explicit landing page is a Page.
+      const ct=(sug?.content_type||"").toLowerCase();
+      const endpoint = wpPostType==="auto" ? (ct.includes("landing")?"pages":"posts") : wpPostType;
       try{
         const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tool:"wppublish",wpUrl:wpUrl.trim(),wpUser:wpUser.trim(),wpPass:wpPass.trim(),title:c.title||sug.title,content:fullHtml,slug:c.slug,excerpt:c.meta_description,status:wpStatus,endpoint,heroImage,categories:selCats,author:authId,authorName:authName.trim()})});
         const d=await r.json();
@@ -9480,13 +11363,13 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
 
   const PHASES=["Strategy","Gap & Suggestions","Gate 1","Content","Gate 2","Publish"];
 
-  const onFile=async(e:React.ChangeEvent<HTMLInputElement>,target:"gtm"|"brief"|"guardrails")=>{
+  const onFile=async(e:React.ChangeEvent<HTMLInputElement>,target:"gtm"|"brief")=>{
     const f=e.target.files?.[0];if(!f)return;
     setErr("");setLoadMsg(`Reading ${f.name}…`);setLoading(true);
     try{
       const t=await extractFileText(f);
       if(!t||t.length<10)throw new Error("File appears empty or unreadable.");
-      if(target==="gtm")setGtm(t);else if(target==="guardrails")setGuardrails(t);else setBrief(t);
+      if(target==="gtm")setGtm(t);else setBrief(t);
     }catch(ex){setErr(ex instanceof Error?ex.message:"File read failed");}
     finally{setLoading(false);}
   };
@@ -9496,10 +11379,10 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
     if(!gtm.trim()&&!brief.trim()){setErr("Add a GTM document or Campaign Brief.");return;}
     setLoading(true);setErr("");setLoadMsg("Parsing GTM + Campaign Brief…");
     try{
-      const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tool:"campaign_strategy",gtm,brief,guardrails,domain:domain.trim()})});
+      const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tool:"campaign_strategy",gtm,brief,domain:domain.trim(),listing:listSubject.trim()?{count:Number(listCount)||5,subject:listSubject.trim()}:null})});
       const d=await r.json();if(d.error)throw new Error(d.error);
-      // Keep guardrails on the strategy so every generated piece respects them.
-      setStrategy({...d.strategy,guardrails:guardrails.trim()||d.strategy?.guardrails||""});setPhase(1);
+      // Carry the listing config on the strategy so every generated piece honours it.
+      setStrategy({...d.strategy,listing:listSubject.trim()?{count:Number(listCount)||5,subject:listSubject.trim()}:null});setPhase(1);
     }catch(e){setErr(e instanceof Error?e.message:"Failed");}finally{setLoading(false);}
   };
 
@@ -9642,9 +11525,30 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
       const batch=idxs.slice(i,i+2);
       await Promise.allSettled(batch.map(async idx=>{
         const sug=contentLength==="auto"?suggestions[idx]:{...suggestions[idx],word_count:Number(contentLength)};
-        const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tool:"campaign_content",suggestion:sug,strategy:{...strategy,domain:domain.trim()}})});
-        const d=await r.json();
-        if(!d.error&&d.content)out[idx]=d.content; else lastErr=d.error||"Generation failed";
+        // A timeout returns text/plain, not JSON — r.json() then throws and allSettled
+        // swallows it, leaving lastErr empty and the user staring at a generic message.
+        try{
+          const payload={tool:"campaign_content",suggestion:sug,strategy:{...strategy,domain:domain.trim()}};
+          // SERP research (~32s) and writing (~80s) together exceed the route's 120s limit,
+          // so they run as two requests. Research failing is survivable — generation just
+          // falls back to doing it inline, which is the original single-call behaviour.
+          let research=null;
+          try{
+            const rr=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...payload,research_only:true})});
+            if(rr.ok){ const rd=await rr.json(); research=rd.research||null; }
+          }catch{/* fall through to inline research */}
+          const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(research?{...payload,research}:payload)});
+          const raw=await r.text();
+          let d:{error?:string;content?:unknown}={};
+          try{ d=JSON.parse(raw); }
+          catch{
+            lastErr=r.status===504||/FUNCTION_INVOCATION_TIMEOUT/i.test(raw)
+              ? `the request timed out after ~${Math.round((r.status===504?300:120))}s (HTTP ${r.status}) — try a shorter target word count`
+              : `server returned HTTP ${r.status} (${raw.slice(0,80).replace(/\s+/g," ").trim()||"empty response"})`;
+            return;
+          }
+          if(!d.error&&d.content)out[idx]=d.content; else lastErr=d.error||"Generation failed";
+        }catch(e){ lastErr=e instanceof Error?`request failed: ${e.message}`:"request failed"; }
       }));
       setGenProgress({done:Math.min(i+2,idxs.length),total:idxs.length});
       setContent({...out});
@@ -9657,6 +11561,18 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
     }
     setPhase(4);
     if(lastErr) setErr(`Some pieces couldn't be generated (${lastErr}). The ones that succeeded are shown below.`);
+    // Interactives are a SEPARATE request per article — they cannot fit inside the content
+    // call's 120s budget. Best-effort and non-blocking: the article is already usable.
+    Promise.allSettled(Object.keys(out).map(Number).map(async idx=>{
+      const c=out[idx];
+      const r=await fetch("/api/tools",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({tool:"interactives",title:c.title||suggestions[idx]?.title,keyword:suggestions[idx]?.target_keyword,
+          article_html:c.article_html,brand:strategy?.company||domain,audience:strategy?.audience||""})});
+      const d=await r.json();
+      if(Array.isArray(d.interactives)&&d.interactives.length){
+        setContent(prev=>({...prev,[idx]:{...prev[idx],interactives:d.interactives}}));
+      }
+    }));
     hist.add(`${strategy?.company||domain} · ${Object.keys(out).length} pieces`,{strategy,suggestions,content:out});
     // Remember every generated article so future runs dedup against it
     saveArticles(Object.keys(out).map(Number).map(idx=>({title:out[idx].title||suggestions[idx]?.title,keyword:suggestions[idx]?.target_keyword,slug:out[idx].slug})));
@@ -9762,10 +11678,21 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
               <label style={{fontSize:11,color:S.accent,cursor:"pointer",fontWeight:600,display:"inline-block",marginTop:6}}>↑ Upload PDF / DOCX / PPTX / TXT<input type="file" accept=".pdf,.docx,.pptx,.txt,.md,.csv,.json" onChange={e=>onFile(e,"brief")} style={{display:"none"}}/></label>
             </Field>
           </div>
-          <Field label="Guardrails (paste or upload) — optional">
-            <TI value={guardrails} onChange={setGuardrails} placeholder="Brand & content guardrails the writer MUST follow: banned words/claims, tone & style rules, compliance/legal constraints, competitors not to mention, mandatory disclaimers…" rows={5}/>
-            <label style={{fontSize:11,color:S.accent,cursor:"pointer",fontWeight:600,display:"inline-block",marginTop:6}}>↑ Upload PDF / DOCX / PPTX / TXT<input type="file" accept=".pdf,.docx,.pptx,.txt,.md,.csv,.json" onChange={e=>onFile(e,"guardrails")} style={{display:"none"}}/></label>
-            <p style={{fontSize:11,color:S.muted,margin:"4px 0 0"}}>Applied as hard rules to every generated article (overrides default style where they conflict).</p>
+          <Field label="Listing article — optional">
+            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap" as const}}>
+              <select value={listCount} onChange={e=>setListCount(e.target.value)}
+                style={{fontSize:13,padding:"9px 10px",border:`1px solid ${S.border}`,borderRadius:8,background:"#fff",color:S.text,fontFamily:"inherit",fontWeight:600}}>
+                {["5","7","10","15","20"].map(n=><option key={n} value={n}>Top {n}</option>)}
+              </select>
+              <div style={{flex:1,minWidth:240}}>
+                <TI value={listSubject} onChange={setListSubject} placeholder="what to list — e.g. EOR providers, AI staffing tools, VMS platforms"/>
+              </div>
+            </div>
+            <p style={{fontSize:11,color:S.muted,margin:"6px 0 0"}}>
+              {listSubject.trim()
+                ? <>Writes a ranked listing: <strong>&ldquo;Top {listCount} {listSubject.trim()}&rdquo;</strong> — one numbered H2 per entry with what it does, who it suits, strengths and limitations, plus a comparison table and a verdict.</>
+                : <>Leave blank for normal articles. Fill it in to generate a ranked list piece instead.</>}
+            </p>
           </Field>
           <Btn onClick={runStrategy} disabled={loading||(!gtm.trim()&&!brief.trim())}>Parse Strategy →</Btn>
         </Card>
@@ -9901,9 +11828,8 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
                 <select value={contentLength} onChange={e=>setContentLength(e.target.value)} style={{fontSize:12,padding:"6px 8px",border:`1px solid ${S.border}`,borderRadius:6,background:"#fff",color:S.text}}>
                   <option value="auto">Auto (SERP-recommended)</option>
                   <option value="600">Short — 600 words</option>
-                  <option value="1000">Standard — 1,000 words</option>
-                  <option value="1500">Long — 1,500 words</option>
-                  <option value="2500">In-depth — 2,500 words</option>
+                  <option value="1000">Standard — 1,000 target (~2,000 delivered)</option>
+                  <option value="1200">Long — 1,200 target (~1,800 delivered)</option>
                   <option value="3500">Pillar — 3,500 words</option>
                 </select>
               </label>
@@ -9936,9 +11862,8 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
                 <select value={contentLength} onChange={e=>setContentLength(e.target.value)} style={{fontSize:12,padding:"6px 8px",border:`1px solid ${S.border}`,borderRadius:6,background:"#fff",color:S.text}}>
                   <option value="auto">Auto (SERP-recommended)</option>
                   <option value="600">Short — 600 words</option>
-                  <option value="1000">Standard — 1,000 words</option>
-                  <option value="1500">Long — 1,500 words</option>
-                  <option value="2500">In-depth — 2,500 words</option>
+                  <option value="1000">Standard — 1,000 target (~2,000 delivered)</option>
+                  <option value="1200">Long — 1,200 target (~1,800 delivered)</option>
                   <option value="3500">Pillar — 3,500 words</option>
                 </select>
               </label>
@@ -9971,6 +11896,7 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
                   <SH title={c.title||suggestions[i].title}/>
                   <div style={{display:"flex",gap:8,alignItems:"center"}}>
                     {aeoBits.length>0&&<span title={`AEO enabled: ${aeoBits.join(", ")}`} style={{fontSize:10,fontWeight:700,color:S.greenText,background:S.greenBg,border:"1px solid #a7f3d0",padding:"2px 8px",borderRadius:4}}>AEO ✓</span>}
+                    {Array.isArray(c.interactives)&&c.interactives.length>0&&<span title={`Interactive widgets (in the HTML export and WordPress publish, not this preview): ${c.interactives.map((x:{kind:string;title:string})=>`${x.title} (${x.kind})`).join(", ")}`} style={{fontSize:10,fontWeight:700,color:"#fff",background:"#0ea5e9",padding:"2px 8px",borderRadius:4}}>⚡ {c.interactives.length} interactive{c.interactives.length>1?"s":""}</span>}
                     <span style={{fontSize:10,fontWeight:700,color:"#fff",background:catColor[suggestions[i].category]||S.muted,padding:"2px 8px",borderRadius:4}}>{suggestions[i].category}</span>
                     {editing[i] ? (<>
                       <button onClick={()=>saveEdit(i)} style={{fontSize:11,fontWeight:700,color:"#fff",background:S.green,border:"none",borderRadius:5,padding:"3px 10px",cursor:"pointer",fontFamily:"inherit"}}>✓ Save</button>
@@ -9983,7 +11909,10 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
                         <option value="hologram">🖼 Holographic UI</option>
                       </select>
                       <button onClick={()=>genImage(i)} disabled={imgBusy[i]} style={{fontSize:11,color:imgBusy[i]?S.muted:S.accent,background:"none",border:"none",cursor:imgBusy[i]?"default":"pointer",fontFamily:"inherit",padding:0}}>{imgBusy[i]?"🖼 Generating…":c.hero_image?"🖼 Regenerate image":"🖼 Generate image"}</button>
-                      <button onClick={()=>{const a=document.createElement("a");a.href="data:text/html;charset=utf-8,"+encodeURIComponent(c.article_html||"");a.download=`${c.slug||"article"}.html`;a.click();}} style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ HTML</button>
+                      <button onClick={()=>{
+                        const doc=standaloneArticleHtml(c,{domain,category:suggestions[i]?.category,authName:authName.trim(),authTitle:authTitle.trim(),authUrl:authUrl.trim(),authBio:authBio.trim()});
+                        const a=document.createElement("a");a.href="data:text/html;charset=utf-8,"+encodeURIComponent(doc);a.download=`${c.slug||"article"}.html`;a.click();
+                      }} title="Download a full, styled, publishable HTML document" style={{fontSize:11,color:S.accent,background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",padding:0}}>↓ HTML</button>
                     </>)}
                   </div>
                 </div>
@@ -9998,6 +11927,31 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
                 </>) : (
                   <div className="rm-article" style={{fontSize:13,lineHeight:1.7,color:S.text,maxHeight:360,overflowY:"auto" as const,border:`1px solid ${S.border}`,borderRadius:8,padding:14}} dangerouslySetInnerHTML={{__html:c.article_html||""}}/>
                 )}
+                {/* Interactives can't run in the preview above — React's dangerouslySetInnerHTML
+                    never executes injected <script>. Each one gets its own sandboxed iframe so
+                    it is fully clickable here, exactly as it will behave once published. */}
+                {!editing[i]&&Array.isArray(c.interactives)&&c.interactives.length>0&&(
+                  <div style={{marginTop:12}}>
+                    <p style={{fontSize:11,fontWeight:700,color:S.muted,textTransform:"uppercase" as const,letterSpacing:"0.05em",margin:"0 0 8px"}}>
+                      ⚡ Interactive widgets — live, and embedded in the ↓ HTML export and WordPress publish
+                    </p>
+                    {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                    {c.interactives.map((inst:any,k:number)=>(
+                      <div key={k} style={{marginBottom:10}}>
+                        <p style={{fontSize:11,color:S.muted,margin:"0 0 4px"}}>Appears after <strong>{inst.after_heading||"(end of article)"}</strong></p>
+                        <iframe
+                          title={inst.title||`Interactive ${k+1}`}
+                          sandbox="allow-scripts"
+                          srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><style>${ARTICLE_CSS}${RMI_CSS}body{margin:0;padding:2px;background:#fff}.instrument{margin:0}</style></head><body>${renderInteractive(inst)}<script>${RMI_RUNTIME}<\/script><script>
+                            // Report our height so the parent can size the frame to fit.
+                            function rmH(){try{parent.postMessage({rmiH:document.documentElement.scrollHeight,rmiK:"${i}-${k}"},"*");}catch(e){}}
+                            window.addEventListener("load",rmH);document.addEventListener("click",function(){setTimeout(rmH,80);});setTimeout(rmH,300);
+                          <\/script></body></html>`}
+                          style={{width:"100%",height:(iframeH[`${i}-${k}`]||320)+"px",border:`1px solid ${S.border}`,borderRadius:8,display:"block",background:"#fff"}}/>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </Card>
             );
           })}
@@ -10011,6 +11965,10 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
               <Field label="Application Password"><TI value={wpPass} onChange={setWpPass} placeholder="xxxx xxxx xxxx xxxx"/></Field>
               <Field label="Publish status"><Toggle value={wpStatus} onChange={v=>setWpStatus(v as "draft"|"publish")} options={[{value:"draft",label:"Draft"},{value:"publish",label:"Publish live"}]}/></Field>
+              <Field label="Publish as">
+                <Toggle value={wpPostType} onChange={v=>setWpPostType(v as "posts"|"pages"|"auto")} options={[{value:"posts",label:"Posts"},{value:"pages",label:"Pages"},{value:"auto",label:"Auto"}]}/>
+                <p style={{fontSize:11,color:S.muted,margin:"4px 0 0"}}>Blog articles belong in <strong>Posts</strong>. <em>Auto</em> sends only pieces typed as a landing page to Pages.</p>
+              </Field>
             </div>
             {/* WordPress categories — hierarchical multi-select dropdown (main → sub) */}
             <div style={{margin:"4px 0 12px",padding:"10px 12px",background:S.subtle,borderRadius:8,border:`1px solid ${S.border}`}}>
@@ -10091,6 +12049,13 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
               </div>
               <Field label="Profile / LinkedIn URL"><TI value={authUrl} onChange={setAuthUrl} placeholder="https://linkedin.com/in/…"/></Field>
               <Field label="Short bio"><TI value={authBio} onChange={setAuthBio} rows={2} placeholder="1-2 sentences on the author's expertise"/></Field>
+              <Field label="Author photo URL — optional">
+                <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                  {authAvatar.trim()&&<img src={authAvatar.trim()} alt="" style={{width:44,height:44,borderRadius:"50%",objectFit:"cover" as const,border:`1px solid ${S.border}`,flexShrink:0}}/>}
+                  <div style={{flex:1,minWidth:0}}><TI value={authAvatar} onChange={setAuthAvatar} placeholder="https://…/prasad-kini.jpg — auto-filled when you pick a WordPress author"/></div>
+                </div>
+                <p style={{fontSize:11,color:S.muted,margin:"4px 0 0"}}>Shown as a circular photo beside the byline. Leave blank to publish the byline without a photo.</p>
+              </Field>
               <p style={{fontSize:11,color:S.muted,margin:"4px 0 0"}}>Adds a Person author to the article schema + an on-page byline/bio box. <strong>Compunnel authors</strong> fill the byline + bio + LinkedIn and are matched to a WordPress user by name on publish. <strong>WordPress users</strong> directly attribute the post. Use “↻ Reload authors” to fetch your site’s WP users.</p>
             </div>
             {publishing&&(
@@ -10145,6 +12110,384 @@ function SEOCampaign({activeSite,setPage}:PageProps) {
   );
 }
 
+// ── SEO Opportunity Engine ──────────────────────────────────────────────────
+function SEOEngine({ activeSite, setActiveSite, gscData, setPage, gscDataMap = {}, ga4DataMap = {} }: PageProps) {
+  const normKey = (d: string) => (d || "").replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
+  const siteKey = normKey(activeSite);
+  const allSites = (() => {
+    const gsc = Object.keys(gscDataMap);
+    const isReal = (s: string) => !/^\d+$/.test(s) && s.includes(".");
+    const ga4 = Object.keys(ga4DataMap).map(k => ga4DataMap[k]?._siteDomain || (isReal(k) ? k : null)).filter((d): d is string => !!d && !gsc.includes(d));
+    return [...gsc, ...new Set(ga4)];
+  })();
+  const [competitors, setCompetitors] = useState(() => { try { return localStorage.getItem(`rm_seoeng_comps_${siteKey}`) || ""; } catch { return ""; } });
+  const [brandRegex, setBrandRegex] = useState(() => { try { return localStorage.getItem(`rm_seoeng_brand_${siteKey}`) || siteKey.split(".")[0]; } catch { return ""; } });
+  const [loading, setLoading] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [data, setData] = useState<any>(null);
+  const [error, setError] = useState("");
+  const [tab, setTab] = useState("queue");
+  const [sortCol, setSortCol] = useState("gain");
+  const [sortDir, setSortDir] = useState<"asc"|"desc">("desc");
+
+  useEffect(() => { try { localStorage.setItem(`rm_seoeng_comps_${siteKey}`, competitors); } catch {} }, [competitors, siteKey]);
+  useEffect(() => { try { localStorage.setItem(`rm_seoeng_brand_${siteKey}`, brandRegex); } catch {} }, [brandRegex, siteKey]);
+
+  const reconnectGsc = () => {
+    localStorage.setItem("rm_seoeng_pending", "1");
+    window.location.href = `/api/auth?site=${encodeURIComponent(activeSite)}`;
+  };
+
+  useEffect(() => {
+    if (localStorage.getItem("rm_seoeng_pending") === "1") {
+      localStorage.removeItem("rm_seoeng_pending");
+      setTimeout(() => analyze(), 500);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const analyze = async () => {
+    if (!activeSite) { setError("Select a site first."); return; }
+    setLoading(true); setError(""); setData(null);
+    try {
+      // Phase 1: Fetch GSC data via the dedicated route (which handles auth correctly)
+      // Use the already-resolved GSC property URL if available (e.g. "sc-domain:compunnel.com")
+      // to skip the site-list resolution step that can fail with stale tokens.
+      const siteParam = gscData?._site || activeSite;
+      const gscUrl = `/api/gsc?site=${encodeURIComponent(siteParam)}&mode=seoengine`;
+      const gscResp = await fetch(gscUrl);
+      const gscResult = await gscResp.json();
+      if (gscResp.status === 401) { reconnectGsc(); return; }
+      if (gscResp.status === 404) { setError(gscResult.error || "No GSC property found for this site."); return; }
+      if (gscResult.error) { setError(gscResult.error); return; }
+
+      // Phase 2: Send GSC data + config to the scoring engine
+      const comps = competitors.split(/[,;\n]/).map(s => s.trim()).filter(Boolean);
+      const r = await fetch("/api/tools", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tool: "seo_engine",
+          domain: gscResult.domain || activeSite,
+          competitors: comps,
+          brandRegex,
+          gscData: gscResult,
+        }),
+      });
+      const j = await r.json();
+      if (j.error && !j.warning) { setError(j.error); return; }
+      if (j.warning) { setError(j.error); return; }
+      setData(j);
+    } catch { setError("Analysis failed — check your network connection."); } finally { setLoading(false); }
+  };
+
+  const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+  const path = (u: string) => { try { return new URL(u).pathname; } catch { return u || "—"; } };
+
+  const MODULE_COLORS: Record<string, { bg: string; color: string; label: string }> = {
+    striking: { bg: "#dbeafe", color: "#1d4ed8", label: "Striking Distance" },
+    lowctr: { bg: "#fef3c7", color: "#92400e", label: "Low CTR" },
+    decay: { bg: "#fee2e2", color: "#b91c1c", label: "Content Decay" },
+    gap: { bg: "#ede9fe", color: "#6d28d9", label: "Competitor Gap" },
+    cannibal: { bg: "#fce7f3", color: "#be185d", label: "Cannibalisation" },
+  };
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sortRows = (rows: any[], col: string) => {
+    const dir = sortDir === "desc" ? -1 : 1;
+    return [...rows].sort((a, b) => {
+      const av = a[col] ?? 0, bv = b[col] ?? 0;
+      if (typeof av === "string") return av.localeCompare(bv) * dir;
+      return ((av as number) - (bv as number)) * dir;
+    });
+  };
+
+  const toggleSort = (col: string) => {
+    if (sortCol === col) setSortDir(d => d === "desc" ? "asc" : "desc");
+    else { setSortCol(col); setSortDir("desc"); }
+  };
+
+  const sortIcon = (col: string) => sortCol === col ? (sortDir === "desc" ? " ↓" : " ↑") : "";
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ThSort = ({ col, children }: { col: string; children: React.ReactNode }) => (
+    <th onClick={() => toggleSort(col)} style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${S.border}`, background: "#f8fafc", whiteSpace: "nowrap", cursor: "pointer", userSelect: "none" }}>
+      {children}{sortIcon(col)}
+    </th>
+  );
+
+  const summaryCards = data ? [
+    { key: "striking", icon: "◎", ...data.summary.striking },
+    { key: "lowctr", icon: "◉", ...data.summary.lowctr },
+    { key: "decay", icon: "↘", ...data.summary.decay },
+    { key: "gap", icon: "◆", ...data.summary.gap, gain: data.summary.gap.gain },
+    { key: "cannibal", icon: "⊘", count: data.summary.cannibal.count },
+  ] : [];
+
+  return (
+    <div>
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 700, color: S.text, margin: "0 0 4px" }}>SEO Opportunity Engine</h2>
+        <p style={{ fontSize: 13, color: S.muted, margin: 0 }}>Automated weekly-grade scoring: striking distance, low CTR, content decay, competitor gap, cannibalisation</p>
+      </div>
+
+      {/* Config */}
+      <Card>
+        {allSites.length > 1 && (
+          <div style={{ marginBottom: 14 }}>
+            <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: S.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>Site</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {allSites.map(s => (
+                <button key={s} onClick={() => setActiveSite(s)}
+                  style={{ padding: "5px 14px", borderRadius: 8, border: `1.5px solid ${normKey(activeSite) === normKey(s) ? S.accent : S.border}`, background: normKey(activeSite) === normKey(s) ? "linear-gradient(135deg,#6366f1,#818cf8)" : "transparent", color: normKey(activeSite) === normKey(s) ? "#fff" : S.muted, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 16, alignItems: "flex-end", flexWrap: "wrap" }}>
+          <div style={{ flex: 2, minWidth: 200 }}>
+            <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: S.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>Competitors (comma-separated)</label>
+            <TI value={competitors} onChange={setCompetitors} placeholder="deel.com, rippling.com, teksystems.com" />
+          </div>
+          <div style={{ flex: 1, minWidth: 140 }}>
+            <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: S.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>Brand filter (regex)</label>
+            <TI value={brandRegex} onChange={setBrandRegex} placeholder="compunnel|eximius" />
+          </div>
+          <Btn onClick={analyze} disabled={loading || !activeSite}>
+            {loading ? "Analyzing..." : "Run Analysis"}
+          </Btn>
+        </div>
+        {!gscData && <p style={{ fontSize: 12, color: S.amber, margin: "12px 0 0" }}>Connect Google Search Console first for GSC-based scoring.</p>}
+        {!data?.summary?.dataForSeo && data && <p style={{ fontSize: 12, color: S.muted, margin: "8px 0 0" }}>DataForSEO not configured — competitor gap analysis skipped. Set DATAFORSEO_LOGIN/PASSWORD in env.</p>}
+      </Card>
+
+      {error && <Card style={{ borderColor: "#fecaca", background: "#fef2f2" }}><p style={{ color: "#b91c1c", margin: 0, fontSize: 13 }}>{error}</p></Card>}
+
+      {loading && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ width: 20, height: 20, border: "3px solid #e2e8f0", borderTopColor: S.accent, borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+            <span style={{ fontSize: 13, color: S.muted }}>Fetching GSC data (5000 rows) + competitor gaps via DataForSEO...</span>
+          </div>
+          <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+        </Card>
+      )}
+
+      {data && (
+        <>
+          {/* Summary cards */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 20 }}>
+            {summaryCards.map(c => {
+              const mc = MODULE_COLORS[c.key];
+              const isActive = tab === c.key;
+              return (
+                <div key={c.key} onClick={() => setTab(tab === c.key ? "queue" : c.key)}
+                  style={{ background: isActive ? mc.bg : S.card, border: `1.5px solid ${isActive ? mc.color : S.border}`, borderRadius: 12, padding: "16px 18px", cursor: "pointer", transition: "all 0.15s", boxShadow: isActive ? `0 2px 8px ${mc.bg}` : S.shadow }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                    <span style={{ fontSize: 14 }}>{c.icon}</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: mc.color, textTransform: "uppercase", letterSpacing: "0.04em" }}>{mc.label}</span>
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: S.text, lineHeight: 1 }}>{c.count}</div>
+                  {"gain" in c && c.gain != null && <div style={{ fontSize: 11, color: S.muted, marginTop: 4 }}>~{fmt(c.gain as number)} clicks/mo potential</div>}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Period info */}
+          <div style={{ fontSize: 11, color: S.muted, marginBottom: 16 }}>
+            Period: {data.period.from} to {data.period.to} vs {data.period.prev_from} to {data.period.prev_to}
+          </div>
+
+          {/* Tab bar */}
+          <div style={{ display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" }}>
+            {[{ key: "queue", label: "Top Actions" }, ...Object.entries(MODULE_COLORS).map(([k, v]) => ({ key: k, label: v.label }))].map(t => (
+              <button key={t.key} onClick={() => setTab(t.key)}
+                style={{ padding: "6px 16px", borderRadius: 20, border: `1.5px solid ${tab === t.key ? S.accent : S.border}`, background: tab === t.key ? S.accentBg : "transparent", color: tab === t.key ? S.accentText : S.muted, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>
+                {t.label}
+                {t.key !== "queue" && data[t.key] && <span style={{ marginLeft: 4, opacity: 0.7 }}>({data[t.key].length})</span>}
+              </button>
+            ))}
+          </div>
+
+          {/* Tables */}
+          <Card style={{ padding: 0, overflow: "hidden" }}>
+            <div style={{ overflowX: "auto" }}>
+              {tab === "queue" && (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>
+                    <ThSort col="module">Module</ThSort>
+                    <ThSort col="keyword">Keyword / Page</ThSort>
+                    <ThSort col="action">Action</ThSort>
+                    <ThSort col="gain">Est. Clicks/mo</ThSort>
+                    <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${S.border}`, background: "#f8fafc" }}></th>
+                  </tr></thead>
+                  <tbody>
+                    {sortRows(data.queue, sortCol).map((r: { module: string; keyword: string; url: string; gain: number; action: string }, i: number) => {
+                      const mc = MODULE_COLORS[r.module] || MODULE_COLORS.striking;
+                      return (
+                        <tr key={i} style={{ background: i % 2 ? "#fafbfc" : "#fff" }}>
+                          <TD><span style={{ background: mc.bg, color: mc.color, fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 5 }}>{mc.label}</span></TD>
+                          <TD bold>{r.keyword || path(r.url)}</TD>
+                          <TD color={S.muted}>{r.action}</TD>
+                          <TD bold color={S.green}>+{fmt(r.gain)}</TD>
+                          <TD>
+                            {r.module === "gap" && <button onClick={() => { try { localStorage.setItem("rm_campaign_seed", JSON.stringify({ keyword: r.keyword, domain: data.domain })); window.dispatchEvent(new Event("rm-campaign-seed")); } catch {} setPage("campaign"); }} style={{ fontSize: 11, color: S.accent, background: "none", border: "none", cursor: "pointer", fontWeight: 600, fontFamily: "inherit" }}>Draft</button>}
+                            {r.url && <a href={r.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: S.accent, marginLeft: 8 }}>View</a>}
+                          </TD>
+                        </tr>
+                      );
+                    })}
+                    {!data.queue.length && <tr><TD color={S.muted}>No actionable opportunities found.</TD></tr>}
+                  </tbody>
+                </table>
+              )}
+
+              {tab === "striking" && (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>
+                    <ThSort col="keyword">Keyword</ThSort>
+                    <ThSort col="position">Position</ThSort>
+                    <ThSort col="impressions">Impressions</ThSort>
+                    <ThSort col="clicks">Clicks</ThSort>
+                    <ThSort col="ctr">CTR</ThSort>
+                    <ThSort col="gain">Est. Gain</ThSort>
+                    <th style={{ padding: "10px 14px", fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${S.border}`, background: "#f8fafc" }}>Page</th>
+                  </tr></thead>
+                  <tbody>
+                    {sortRows(data.striking, sortCol).map((r: { keyword: string; position: number; impressions: number; clicks: number; ctr: number; gain: number; url: string }, i: number) => (
+                      <tr key={i} style={{ background: i % 2 ? "#fafbfc" : "#fff" }}>
+                        <TD bold>{r.keyword}</TD>
+                        <TD>{r.position}</TD>
+                        <TD>{fmt(r.impressions)}</TD>
+                        <TD>{r.clicks}</TD>
+                        <TD>{r.ctr}%</TD>
+                        <TD bold color={S.green}>+{fmt(r.gain)}</TD>
+                        <TD><a href={r.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: S.accent }}>{path(r.url)}</a></TD>
+                      </tr>
+                    ))}
+                    {!data.striking.length && <tr><TD color={S.muted}>No striking-distance keywords found.</TD></tr>}
+                  </tbody>
+                </table>
+              )}
+
+              {tab === "lowctr" && (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>
+                    <ThSort col="keyword">Keyword</ThSort>
+                    <ThSort col="position">Position</ThSort>
+                    <ThSort col="impressions">Impressions</ThSort>
+                    <ThSort col="ctr">CTR</ThSort>
+                    <ThSort col="expected_ctr">Expected</ThSort>
+                    <ThSort col="gain">Est. Gain</ThSort>
+                    <th style={{ padding: "10px 14px", fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${S.border}`, background: "#f8fafc" }}>Page</th>
+                  </tr></thead>
+                  <tbody>
+                    {sortRows(data.lowctr, sortCol).map((r: { keyword: string; position: number; impressions: number; ctr: number; expected_ctr: number; gain: number; url: string }, i: number) => (
+                      <tr key={i} style={{ background: i % 2 ? "#fafbfc" : "#fff" }}>
+                        <TD bold>{r.keyword}</TD>
+                        <TD>{r.position}</TD>
+                        <TD>{fmt(r.impressions)}</TD>
+                        <TD color={S.red}>{r.ctr}%</TD>
+                        <TD color={S.green}>{r.expected_ctr}%</TD>
+                        <TD bold color={S.green}>+{fmt(r.gain)}</TD>
+                        <TD><a href={r.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: S.accent }}>{path(r.url)}</a></TD>
+                      </tr>
+                    ))}
+                    {!data.lowctr.length && <tr><TD color={S.muted}>No low-CTR keywords found.</TD></tr>}
+                  </tbody>
+                </table>
+              )}
+
+              {tab === "decay" && (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>
+                    <ThSort col="page">Page</ThSort>
+                    <ThSort col="clicks_prev">Prior Clicks</ThSort>
+                    <ThSort col="clicks_cur">Current Clicks</ThSort>
+                    <ThSort col="change">Change</ThSort>
+                    <ThSort col="gain">Clicks Lost</ThSort>
+                  </tr></thead>
+                  <tbody>
+                    {sortRows(data.decay, sortCol).map((r: { page: string; clicks_prev: number; clicks_cur: number; change: number; gain: number }, i: number) => (
+                      <tr key={i} style={{ background: i % 2 ? "#fafbfc" : "#fff" }}>
+                        <TD><a href={r.page} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: S.accent }}>{path(r.page)}</a></TD>
+                        <TD>{fmt(r.clicks_prev)}</TD>
+                        <TD>{fmt(r.clicks_cur)}</TD>
+                        <TD bold color={S.red}>{r.change}%</TD>
+                        <TD bold color={S.red}>{fmt(r.gain)}</TD>
+                      </tr>
+                    ))}
+                    {!data.decay.length && <tr><TD color={S.muted}>No decaying pages found.</TD></tr>}
+                  </tbody>
+                </table>
+              )}
+
+              {tab === "gap" && (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>
+                    <ThSort col="keyword">Keyword</ThSort>
+                    <ThSort col="volume">Volume</ThSort>
+                    <ThSort col="kd">KD</ThSort>
+                    <ThSort col="competitor">Competitor</ThSort>
+                    <ThSort col="comp_pos">Comp Pos</ThSort>
+                    <ThSort col="gain">Est. Clicks/mo</ThSort>
+                    <th style={{ padding: "10px 14px", fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${S.border}`, background: "#f8fafc" }}></th>
+                  </tr></thead>
+                  <tbody>
+                    {sortRows(data.gap, sortCol).map((r: { keyword: string; volume: number; kd: number; competitor: string; comp_pos: number; gain: number }, i: number) => (
+                      <tr key={i} style={{ background: i % 2 ? "#fafbfc" : "#fff" }}>
+                        <TD bold>{r.keyword}</TD>
+                        <TD>{fmt(r.volume)}</TD>
+                        <TD><span style={{ color: r.kd <= 20 ? S.green : r.kd <= 35 ? S.amber : S.red, fontWeight: 600 }}>{r.kd}</span></TD>
+                        <TD color={S.muted}>{r.competitor}</TD>
+                        <TD>{r.comp_pos}</TD>
+                        <TD bold color={S.green}>+{fmt(r.gain)}</TD>
+                        <TD><button onClick={() => { try { localStorage.setItem("rm_campaign_seed", JSON.stringify({ keyword: r.keyword, domain: data.domain })); window.dispatchEvent(new Event("rm-campaign-seed")); } catch {} setPage("campaign"); }} style={{ fontSize: 11, color: S.accent, background: "none", border: "none", cursor: "pointer", fontWeight: 600, fontFamily: "inherit" }}>Draft</button></TD>
+                      </tr>
+                    ))}
+                    {!data.gap.length && <tr><TD color={S.muted}>{data.summary.dataForSeo ? "No competitor gap keywords found." : "DataForSEO not configured — add DATAFORSEO_LOGIN/PASSWORD."}</TD></tr>}
+                  </tbody>
+                </table>
+              )}
+
+              {tab === "cannibal" && (
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr>
+                    <ThSort col="keyword">Keyword</ThSort>
+                    <ThSort col="impressions">Impressions</ThSort>
+                    <ThSort col="position">Avg Position</ThSort>
+                    <ThSort col="urls_competing">URLs Competing</ThSort>
+                    <th style={{ padding: "10px 14px", textAlign: "left", fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: "0.05em", borderBottom: `1px solid ${S.border}`, background: "#f8fafc" }}>Pages</th>
+                  </tr></thead>
+                  <tbody>
+                    {sortRows(data.cannibal, sortCol).map((r: { keyword: string; impressions: number; position: number; urls_competing: number; urls: string[] }, i: number) => (
+                      <tr key={i} style={{ background: i % 2 ? "#fafbfc" : "#fff" }}>
+                        <TD bold>{r.keyword}</TD>
+                        <TD>{fmt(r.impressions)}</TD>
+                        <TD>{r.position}</TD>
+                        <TD bold color={S.red}>{r.urls_competing}</TD>
+                        <TD>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                            {r.urls.map((u, j) => <a key={j} href={u} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: S.accent, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 280, display: "block" }}>{path(u)}</a>)}
+                          </div>
+                        </TD>
+                      </tr>
+                    ))}
+                    {!data.cannibal.length && <tr><TD color={S.muted}>No keyword cannibalisation detected.</TD></tr>}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}
+
 const PAGES: Record<string, React.ComponentType<PageProps>> = {
   dashboard: Dashboard,
   gsc: GSC,
@@ -10194,6 +12537,7 @@ const PAGES: Record<string, React.ComponentType<PageProps>> = {
   serpcontent: ContentSERP,
   campaign: SEOCampaign,
   seoagent: SEOCampaign,
+  seoengine: SEOEngine,
 };
 
 type AuthUser = { id: string; email: string; name: string };
@@ -10239,7 +12583,7 @@ export default function RankMind({ user, onSignOut }: { user: AuthUser; onSignOu
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   // gscData/ga4Data for non-dashboard pages — use activeDomain strictly, no cross-site fallback
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const gscData:any = gscDataMap[activeDomain] || null;
+  const gscData:any = gscDataMap[activeDomain] || gscDataMap[activeDomain.replace(/^www\./,"")] || Object.values(gscDataMap).find((d:any)=>(d?.domain||"")===activeDomain || (d?.domain||"")===activeDomain.replace(/^www\./,"")) || null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const ga4Data:any = ga4DataMap[activeDomain] || Object.values(ga4DataMap).find((d:any)=>(d?.domain||"")===activeDomain) || null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -10260,7 +12604,8 @@ export default function RankMind({ user, onSignOut }: { user: AuthUser; onSignOu
     const params = new URLSearchParams(window.location.search);
     if (params.get("connected") !== "true") return;
     window.history.replaceState({}, "", "/");
-    if (localStorage.getItem("rm_auto_gsc_site")) setPage("gsc");
+    if (localStorage.getItem("rm_seoeng_pending")) setPage("seoengine");
+    else if (localStorage.getItem("rm_auto_gsc_site")) setPage("gsc");
     else if (localStorage.getItem("rm_auto_ga4_prop")) setPage("ga4");
   }, []);
 

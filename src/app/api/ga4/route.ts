@@ -68,7 +68,9 @@ export async function GET(req: NextRequest) {
     { name: "bounceRate" }, { name: "averageSessionDuration" }, { name: "conversions" },
   ];
 
-  const [summaryRes, prevSummaryRes, sourceRes, pageRes, dailyRes, channelRes] = await Promise.all([
+  const wantMonthly = req.nextUrl.searchParams.get("monthly") === "1";
+
+  const [summaryRes, prevSummaryRes, sourceRes, pageRes, dailyRes, channelRes, monthlyRes] = await Promise.all([
     fetch(base, { method: "POST", headers, body: JSON.stringify({ dateRanges: [{ startDate, endDate }], metrics }) }),
     fetch(base, { method: "POST", headers, body: JSON.stringify({ dateRanges: [{ startDate: prevStart, endDate: prevEnd }], metrics }) }),
     fetch(base, { method: "POST", headers, body: JSON.stringify({ dateRanges: [{ startDate, endDate }], dimensions: [{ name: "sessionSource" }], metrics: [{ name: "sessions" }], orderBys: [{ metric: { metricName: "sessions" }, desc: true }], limit: 25 }) }),
@@ -79,6 +81,10 @@ export async function GET(req: NextRequest) {
     fetch(base, { method: "POST", headers, body: JSON.stringify({ dateRanges: [{ startDate, endDate }], dimensions: [{ name: "date" }], metrics: [{ name: "sessions" }] }) }),
     // Channel grouping aggregates social referrers into "Organic Social" / "Paid Social"
     fetch(base, { method: "POST", headers, body: JSON.stringify({ dateRanges: [{ startDate, endDate }], dimensions: [{ name: "sessionDefaultChannelGroup" }], metrics: [{ name: "sessions" }], orderBys: [{ metric: { metricName: "sessions" }, desc: true }], limit: 25 }) }),
+    // yearMonth x channel — the series behind the stacked Channel Mix trend.
+    wantMonthly
+      ? fetch(base, { method: "POST", headers, body: JSON.stringify({ dateRanges: [{ startDate, endDate }], dimensions: [{ name: "yearMonth" }, { name: "sessionDefaultChannelGroup" }], metrics: [{ name: "sessions" }], limit: 500 }) })
+      : Promise.resolve(new Response("{}")),
   ]);
 
   const safeJson = async (r: Response) => { try { return await r.json(); } catch { return {}; } };
@@ -125,6 +131,18 @@ export async function GET(req: NextRequest) {
   // Channel grouping (Organic Search, Direct, Organic Social, Paid Social, Referral, Email, …)
   const channelRows = (channelData.rows || []) as { dimensionValues: { value: string }[]; metricValues: { value: string }[] }[];
   const totalChannelSessions = channelRows.reduce((s, r) => s + Math.round(+r.metricValues[0].value), 0);
+  // Flatten GA4's yearMonth x channel rows into {month, channel, sessions}. GA4 returns
+  // yearMonth as "YYYYMM"; normalised to "YYYY-MM" so it sorts and labels like the rest.
+  const monthlyRaw = (await safeJson(monthlyRes)) as { rows?: { dimensionValues?: { value: string }[]; metricValues?: { value: string }[] }[] };
+  const monthlyChannels = (monthlyRaw.rows || []).map(r => {
+    const ym = String(r.dimensionValues?.[0]?.value || "");
+    return {
+      month: ym.length === 6 ? `${ym.slice(0, 4)}-${ym.slice(4)}` : ym,
+      channel: String(r.dimensionValues?.[1]?.value || "Unassigned"),
+      sessions: Math.round(Number(r.metricValues?.[0]?.value) || 0),
+    };
+  }).filter(r => r.month).sort((a, b) => a.month.localeCompare(b.month));
+
   const channels = channelRows.map(r => ({
     channel: r.dimensionValues[0].value,
     sessions: Math.round(+r.metricValues[0].value),
@@ -156,6 +174,7 @@ export async function GET(req: NextRequest) {
       pct: totalSourceSessions > 0 ? Math.round((+r.metricValues[0].value / totalSourceSessions) * 100) : 0,
     })),
     channels,
+    monthly_channels: monthlyChannels,
     social_sessions: social,
     pages: (pageData.rows || []).slice(0, 10).map((r: { dimensionValues: { value: string }[]; metricValues: { value: string }[] }) => ({
       page: r.dimensionValues[0].value,

@@ -6,6 +6,13 @@ export const SYNC_PREFIXES = [
   "rm_wp_url", "rm_wp_user", "rm_wp_pass", "rm_wp_auth_",
   "rm_wp_cats_", "rm_wp_selcats_", "rm_hist_", "rm_articles_",
   "rm_content_guideline", "rm_content_guideline_name",
+  // Per-domain tracked-keyword watchlists. Omitting these meant a list built on one machine
+  // was invisible on every other one, with no indication it had not travelled.
+  "rm_tracked_kw_",
+  // WordPress "publish as Posts/Pages" choice — a workspace setting, not a device one.
+  "rm_wp_posttype",
+  // SEO Opportunity Engine config (competitors list + brand filter per site).
+  "rm_seoeng_comps_", "rm_seoeng_brand_",
 ];
 
 export const isSyncKey = (k: string) => SYNC_PREFIXES.some(p => k === p || k.startsWith(p));

@@ -6,14 +6,21 @@ import { dfsConfigured, dfsDomainOverview, dfsIntersection, dfsOnPageAudit, dfsT
 import { startCrawl, tickCrawl, getCrawlStatus } from "@/lib/crawl-job";
 import { getRedis } from "@/lib/db";
 import { EXIMIUS_KB, isEximiusProject } from "@/lib/eximius-kb";
+import { COMPUNNEL_BRAND, isCompunnelProject } from "@/lib/compunnel-brand";
+import { zohoConfigured, zohoAll, zohoDc, isOrganicSource } from "@/lib/zoho";
 
-// 120s: the onpage_audit DataForSEO crawl runs close to 80s on slow sites.
+// 120s: the onpage_audit DataForSEO crawl runs close to 80s on slow sites. Raising this to
+// 300 changes how Vercel groups routes into functions and breaks the Hobby plan's 12-function
+// cap — so the article pipeline has to fit inside 120s (see INTERACTIVE_BUDGET_MS).
 export const maxDuration = 120;
 
 // ── GET dispatcher ────────────────────────────────────────────────────────────
 export async function GET(req: NextRequest) {
   const tool = req.nextUrl.searchParams.get("tool");
 
+  if (tool === "zoho") return handleZoho(req);
+  if (tool === "widget") return handleWidgetView(req);
+  if (tool === "report") return handleReportView(req);
   if (tool === "llmstxt") return handleLlmsTxt(req);
   if (tool === "pricingmd") return handlePricingMd(req);
   if (tool === "cwv") return handleCWV(req);
@@ -171,6 +178,9 @@ export async function POST(req: NextRequest) {
   const body = await req.json();
   const tool = body.tool;
 
+  if (tool === "widget_save") return handleWidgetSave(body);
+  if (tool === "report_share") return handleReportShare(body);
+  if (tool === "interactives") return handleInteractives(body);
   if (tool === "calendar") return handleCalendar(body);
   if (tool === "soaiv") return handleSOAIV(body);
   if (tool === "wppublish") return handleWpPublish(body);
@@ -186,6 +196,7 @@ export async function POST(req: NextRequest) {
   if (tool === "linkprospects") return handleLinkProspects(body);
   if (tool === "crawl_start") return handleCrawlStart(body);
   if (tool === "crawl_tick") return handleCrawlTick(body);
+  if (tool === "seo_engine") return handleSeoEngine(body, req);
 
   return NextResponse.json({ error: "Unknown tool" }, { status: 400 });
 }
@@ -474,15 +485,544 @@ Generate 6-8 cluster pages specific to "${topic}".`;
   }
 }
 
+// ── Article interactives ──────────────────────────────────────────────────────
+// The model supplies DATA ONLY, against four fixed archetypes. It never emits
+// JavaScript — the runtime is hand-written and identical for every article, so a
+// bad generation can produce a useless widget but never executable content.
+//
+//  dial        — compare N framings of the same number (figure + facts + scale bar)
+//  classifier  — run N scenarios through the same set of verdict rows
+//  assessment  — N scored questions → a tier with next steps
+//  calculator  — N numeric inputs → base + Σ(value × coefficient)
+
+export type Interactive =
+  | { kind: "dial"; id: string; title: string; hint: string; after_heading: string; scale: { max: number; unit: string }; options: { label: string; figure: string; sub: string; value: number; facts: { label: string; text: string }[] }[] }
+  | { kind: "classifier"; id: string; title: string; hint: string; after_heading: string; rows: string[]; scenarios: { label: string; verdicts: { state: "y" | "w" | "n"; text: string }[]; note: string }[] }
+  | { kind: "assessment"; id: string; title: string; hint: string; after_heading: string; questions: string[]; tiers: { name: string; min: number; max: number; desc: string; steps: string[] }[] }
+  | { kind: "calculator"; id: string; title: string; hint: string; after_heading: string; base: number; inputs: { label: string; unit: string; default: number; min: number; max: number; coefficient: number }[]; output: { label: string; prefix: string; suffix: string; decimals: number }; note: string };
+
+const num = (v: unknown, fallback = 0) => { const n = Number(v); return Number.isFinite(n) ? n : fallback; };
+const str = (v: unknown, cap = 400) => String(v ?? "").replace(/<[^>]*>/g, "").trim().slice(0, cap);
+const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+// Reject anything that does not fully satisfy its archetype. A half-built widget is
+// worse than no widget, so partial structures are dropped rather than patched.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function validateInteractive(raw: any, idx: number): Interactive | null {
+  if (!raw || typeof raw !== "object") return null;
+  const kind = String(raw.kind || "").toLowerCase();
+  const id = `rmi-${idx}`;
+  const title = str(raw.title, 90);
+  const hint = str(raw.hint, 60);
+  const after_heading = str(raw.after_heading, 160);
+  if (!title) return null;
+
+  if (kind === "dial") {
+    const options = arr(raw.options).slice(0, 4).map(o => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const x = o as any;
+      const facts = arr(x?.facts).slice(0, 4)
+        .map(f => ({ label: str((f as { label?: string })?.label, 40), text: str((f as { text?: string })?.text, 320) }))
+        .filter(f => f.label && f.text);
+      return { label: str(x?.label, 44), figure: str(x?.figure, 14), sub: str(x?.sub, 70), value: num(x?.value), facts };
+    }).filter(o => o.label && o.figure && o.facts.length >= 2);
+    if (options.length < 2) return null;
+    const max = Math.max(num(raw?.scale?.max), ...options.map(o => o.value)) || 100;
+    return { kind: "dial", id, title, hint: hint || "Select a lens", after_heading, scale: { max, unit: str(raw?.scale?.unit, 40) }, options };
+  }
+
+  if (kind === "classifier") {
+    const rows = arr(raw.rows).slice(0, 4).map(r => str(r, 34)).filter(Boolean);
+    if (rows.length < 2) return null;
+    const scenarios = arr(raw.scenarios).slice(0, 8).map(s => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const x = s as any;
+      const verdicts = arr(x?.verdicts).slice(0, rows.length).map(v => {
+        const st = String((v as { state?: string })?.state || "").toLowerCase();
+        return { state: (st === "y" || st === "w" || st === "n" ? st : "w") as "y" | "w" | "n", text: str((v as { text?: string })?.text, 40) };
+      }).filter(v => v.text);
+      return { label: str(x?.label, 120), verdicts, note: str(x?.note, 340) };
+    }).filter(s => s.label && s.verdicts.length === rows.length);
+    if (scenarios.length < 3) return null;
+    return { kind: "classifier", id, title, hint: hint || "Pick a scenario", after_heading, rows, scenarios };
+  }
+
+  if (kind === "assessment") {
+    const questions = arr(raw.questions).slice(0, 8).map(q => str(q, 180)).filter(Boolean);
+    if (questions.length < 3) return null;
+    const top = questions.length * 2;
+    let tiers = arr(raw.tiers).slice(0, 4).map(t => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const x = t as any;
+      return {
+        name: str(x?.name, 30), min: num(x?.min), max: num(x?.max), desc: str(x?.desc, 340),
+        steps: arr(x?.steps).slice(0, 4).map(s => str(s, 220)).filter(Boolean),
+      };
+    }).filter(t => t.name && t.desc && t.steps.length);
+    if (tiers.length < 2) return null;
+    // Re-derive the score bands in code: the model routinely returns ranges that leave
+    // gaps or overlap, which would make some scores match no tier at all.
+    tiers = tiers.sort((a, b) => a.min - b.min).map((t, i, all) => {
+      const lo = Math.round((top / all.length) * i);
+      const hi = i === all.length - 1 ? top : Math.round((top / all.length) * (i + 1)) - 1;
+      return { ...t, min: lo, max: hi };
+    });
+    return { kind: "assessment", id, title, hint: hint || `${questions.length} questions`, after_heading, questions, tiers };
+  }
+
+  if (kind === "calculator") {
+    const inputs = arr(raw.inputs).slice(0, 4).map(i => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const x = i as any;
+      const min = num(x?.min, 0);
+      const max = Math.max(num(x?.max, 100), min + 1);
+      return {
+        label: str(x?.label, 60), unit: str(x?.unit, 24),
+        default: Math.min(Math.max(num(x?.default, min), min), max),
+        min, max, coefficient: num(x?.coefficient),
+      };
+    }).filter(i => i.label && i.coefficient !== 0);
+    if (inputs.length < 2) return null;
+    return {
+      kind: "calculator", id, title, hint: hint || "Adjust the inputs", after_heading,
+      base: num(raw.base), inputs,
+      output: {
+        label: str(raw?.output?.label, 50) || "Estimated total",
+        prefix: str(raw?.output?.prefix, 4), suffix: str(raw?.output?.suffix, 12),
+        decimals: Math.min(Math.max(num(raw?.output?.decimals), 0), 2),
+      },
+      note: str(raw.note, 320),
+    };
+  }
+
+  return null;
+}
+
+// Ask for 2-3 instruments matched to the article's actual sections.
+async function buildInteractives(opts: { title: string; keyword: string; headings: string[]; brand: string; audience: string }): Promise<Interactive[]> {
+  const heads = opts.headings.slice(0, 12).join(" | ") || "n/a";
+  const prompt = `You design interactive widgets for a B2B article. Return DATA ONLY — never code.
+
+ARTICLE: "${opts.title}" (primary keyword: ${opts.keyword})
+SECTION HEADINGS: ${heads}
+BRAND: ${opts.brand || "n/a"}. AUDIENCE: ${opts.audience || "business decision makers"}.
+
+Choose the 2-3 archetypes that genuinely fit THIS article's subject. Do not force a poor fit — returning 2 strong widgets beats 3 weak ones.
+Set "after_heading" to the EXACT text of the section heading each widget should follow.
+
+{"interactives":[
+ {"kind":"dial","title":"...","hint":"...","after_heading":"exact heading text","scale":{"max":100,"unit":"% of workforce"},
+  "options":[{"label":"short tab label","figure":"4.3%","sub":"6.9 million workers","value":4.3,
+    "facts":[{"label":"What it counts","text":"..."},{"label":"What it leaves out","text":"..."},{"label":"Use it for","text":"..."},{"label":"Source","text":"..."}]}]},
+
+ {"kind":"classifier","title":"...","hint":"...","after_heading":"exact heading text",
+  "rows":["Verdict row 1","Verdict row 2","Verdict row 3"],
+  "scenarios":[{"label":"a concrete real-world case","verdicts":[{"state":"y|w|n","text":"short verdict"}],"note":"what to watch out for"}]},
+
+ {"kind":"assessment","title":"...","hint":"...","after_heading":"exact heading text",
+  "questions":["yes/partly/no question about the reader's own situation"],
+  "tiers":[{"name":"Tier name","min":0,"max":4,"desc":"what this score means","steps":["next step"]}]},
+
+ {"kind":"calculator","title":"...","hint":"...","after_heading":"exact heading text","base":0,
+  "inputs":[{"label":"Input name","unit":"workers","default":50,"min":1,"max":500,"coefficient":120}],
+  "output":{"label":"Estimated annual cost","prefix":"$","suffix":"/year","decimals":0},"note":"what the estimate assumes"}
+]}
+
+RULES:
+- dial: 3-4 options, each with 4 facts. "value" must be the numeric form of "figure" and sit on the same scale.
+- classifier: 3-4 rows, 5-8 scenarios. Every scenario's "verdicts" array must have EXACTLY one entry per row, in row order. state: y=yes, w=depends/caution, n=no.
+- assessment: 5-6 questions, 4 tiers. Questions must be answerable yes/partly/no about the reader's own organisation.
+- calculator: 2-4 inputs. The result is computed as base + sum(value x coefficient) — pick coefficients so a realistic input set gives a credible number. No other formula is possible, so design for it.
+- Every figure, fact and coefficient must be defensible. Do not invent statistics or attribute numbers to sources that did not publish them.
+Return ONLY valid JSON.`;
+
+  try {
+    const text = await callAI(prompt, 6000, true);
+    const parsed = parseJSON(text) as { interactives?: unknown[] };
+    return arr(parsed?.interactives).slice(0, 3)
+      .map((raw, i) => validateInteractive(raw, i))
+      .filter((x): x is Interactive => x !== null);
+  } catch {
+    return []; // interactives are additive — never fail the article over them
+  }
+}
+
+// Interactives run as their OWN request. Article generation already spends ~32s on research
+// plus ~80s writing, leaving no room inside the 120s function for another AI call.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function handleInteractives(body: any) {
+  const title = String(body.title || "").trim();
+  if (!title) return NextResponse.json({ error: "No title" }, { status: 400 });
+  const headings = Array.isArray(body.headings)
+    ? body.headings.map((h: unknown) => String(h)).filter(Boolean)
+    : String(body.article_html || "").match(/<h2[^>]*>([\s\S]*?)<\/h2>/gi)?.map(h => h.replace(/<[^>]+>/g, "").trim()).filter(Boolean) || [];
+  try {
+    const interactives = await buildInteractives({
+      title,
+      keyword: String(body.keyword || ""),
+      headings,
+      brand: String(body.brand || ""),
+      audience: String(body.audience || ""),
+    });
+    return NextResponse.json({ interactives });
+  } catch (e) {
+    return NextResponse.json({ error: e instanceof Error ? e.message : "Failed" }, { status: 500 });
+  }
+}
+
+// ── Zoho CRM ──────────────────────────────────────────────────────────────────
+// Lives on /api/tools rather than its own route: the Hobby plan caps this project at 12
+// serverless functions and it is already at the limit, so a dedicated /api/zoho route would
+// fail the deploy outright.
+//
+// Purpose is attribution — tying organic search to actual pipeline, not just clicks.
+async function handleZoho(req: NextRequest) {
+  if (!zohoConfigured()) {
+    return NextResponse.json({
+      configured: false,
+      dc: zohoDc(),
+      error: "Zoho is not connected. Add ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET and ZOHO_REFRESH_TOKEN (plus ZOHO_DC if the account is not in the US data centre).",
+    });
+  }
+  const days = Math.max(1, Math.min(365, Number(req.nextUrl.searchParams.get("days")) || 90));
+  const since = Date.now() - days * 86400000;
+  const recent = (r: Record<string, unknown>) => {
+    const t = Date.parse(String(r.Created_Time || ""));
+    return Number.isFinite(t) ? t >= since : true;   // keep undated rows rather than hiding them
+  };
+
+  try {
+    const [leadsRaw, dealsRaw] = await Promise.all([
+      zohoAll("Leads", ["Company", "Last_Name", "Email", "Lead_Source", "Lead_Status", "Created_Time"]).catch(() => []),
+      zohoAll("Deals", ["Deal_Name", "Amount", "Stage", "Closing_Date", "Lead_Source", "Created_Time"]).catch(() => []),
+    ]);
+    const leads = leadsRaw.filter(recent);
+    const deals = dealsRaw.filter(recent);
+
+    const bySource = (rows: Record<string, unknown>[]) => {
+      const m = new Map<string, number>();
+      rows.forEach(r => { const k = String(r.Lead_Source || "Unspecified"); m.set(k, (m.get(k) || 0) + 1); });
+      return [...m.entries()].map(([source, count]) => ({ source, count, organic: isOrganicSource(source) }))
+        .sort((a, b) => b.count - a.count);
+    };
+    const amount = (r: Record<string, unknown>) => Number(r.Amount) || 0;
+    const won = deals.filter(d => /won/i.test(String(d.Stage || "")));
+    const lost = deals.filter(d => /lost/i.test(String(d.Stage || "")));
+    const open = deals.filter(d => !/won|lost/i.test(String(d.Stage || "")));
+    const organicDeals = deals.filter(d => isOrganicSource(d.Lead_Source));
+
+    return NextResponse.json({
+      configured: true,
+      dc: zohoDc(),
+      range_days: days,
+      leads: {
+        total: leads.length,
+        organic: leads.filter(l => isOrganicSource(l.Lead_Source)).length,
+        by_source: bySource(leads).slice(0, 12),
+        recent: leads.slice(0, 20).map(l => ({
+          name: [l.Company, l.Last_Name].filter(Boolean).join(" · ") || String(l.Email || "Unnamed"),
+          source: String(l.Lead_Source || "Unspecified"),
+          status: String(l.Lead_Status || ""),
+          created: String(l.Created_Time || ""),
+        })),
+      },
+      deals: {
+        total: deals.length,
+        open: open.length,
+        won: won.length,
+        lost: lost.length,
+        pipeline_value: Math.round(open.reduce((a, d) => a + amount(d), 0)),
+        won_value: Math.round(won.reduce((a, d) => a + amount(d), 0)),
+        // The number that justifies an SEO budget: revenue Zoho itself attributes to organic.
+        organic_won_value: Math.round(organicDeals.filter(d => /won/i.test(String(d.Stage || ""))).reduce((a, d) => a + amount(d), 0)),
+        organic_count: organicDeals.length,
+        by_source: bySource(deals).slice(0, 12),
+      },
+    });
+  } catch (e) {
+    return NextResponse.json({ configured: true, dc: zohoDc(), error: e instanceof Error ? e.message : "Zoho request failed" }, { status: 502 });
+  }
+}
+
+// ── Hosted interactive widgets ────────────────────────────────────────────────
+// WordPress runs wp_kses_post on REST-published content, which strips <script> and
+// inline <style> for any user without unfiltered_html — and most security plugins strip
+// it even for admins. Inlining the widget runtime therefore produces DEAD widgets on a
+// real site. Instead each widget is stored here and embedded as an <iframe src>, the same
+// way YouTube/Typeform embeds survive: no inline JS for the sanitizer to remove.
+const WIDGET_TTL = 60 * 60 * 24 * 365;   // widgets outlive reports: they are part of a published page
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function handleWidgetSave(body: any) {
+  const html = String(body.html || "");
+  if (!html || html.length < 100) return NextResponse.json({ error: "Nothing to save" }, { status: 400 });
+  if (html.length > 400_000) return NextResponse.json({ error: "Widget too large" }, { status: 413 });
+  if (!/data-rmi=/.test(html)) return NextResponse.json({ error: "Unrecognised widget document" }, { status: 400 });
+  const r = getRedis();
+  if (!r) return NextResponse.json({ error: "Widget hosting unavailable (Redis not configured)." }, { status: 503 });
+  const id = reportId();
+  try {
+    await r.set(`widget:${id}`, html, { ex: WIDGET_TTL });
+    return NextResponse.json({ id, path: `/api/tools?tool=widget&id=${id}` });
+  } catch (e) {
+    return NextResponse.json({ error: e instanceof Error ? e.message : "Could not save widget" }, { status: 500 });
+  }
+}
+
+async function handleWidgetView(req: NextRequest) {
+  const id = (req.nextUrl.searchParams.get("id") || "").replace(/[^a-z0-9]/gi, "").slice(0, 32);
+  const r = id ? getRedis() : null;
+  const html = r ? await r.get<string>(`widget:${id}`).catch(() => null) : null;
+  if (!html) return new NextResponse("<!DOCTYPE html><html><body style=\"font:13px sans-serif;color:#64748b;margin:0;padding:12px\">This interactive is no longer available.</body></html>",
+    { status: 404, headers: { "content-type": "text/html; charset=utf-8" } });
+  return new NextResponse(String(html), {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "public, max-age=86400",
+      // Must be embeddable from the customer's own site, so no X-Frame-Options DENY here.
+      "content-security-policy": "frame-ancestors *",
+      "x-robots-tag": "noindex",
+    },
+  });
+}
+
+// ── Shareable report links ────────────────────────────────────────────────────
+// Reports are generated client side into about:blank, which has no URL to send anyone.
+// These two handlers park the finished HTML in Redis under an unguessable id and serve
+// it back as a real page. Both live on the EXISTING /api/tools route on purpose: this
+// project is on Vercel's Hobby plan, already at the 12-serverless-function cap, so a
+// dedicated /api/report route would fail the deploy outright.
+//
+// Anyone holding the link can read the report — it carries no auth by design, because
+// the point is to send it to people without accounts. Links expire after 30 days.
+
+const REPORT_TTL = 60 * 60 * 24 * 30;
+const MAX_REPORT_BYTES = 900_000;
+
+function reportId(): string {
+  // 22 chars of crypto-random base36 — not sequential, not guessable by enumeration.
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b).map(x => x.toString(36).padStart(2, "0")).join("").slice(0, 22);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function handleReportShare(body: any) {
+  const html = String(body.html || "");
+  if (!html || html.length < 200) return NextResponse.json({ error: "Nothing to share" }, { status: 400 });
+  if (html.length > MAX_REPORT_BYTES) return NextResponse.json({ error: "Report too large to share" }, { status: 413 });
+  // Only ever store a document we generated: refuse anything that isn't our report shell.
+  if (!/^<!DOCTYPE html>/i.test(html.trim()) || !/<title>Analytics Report/i.test(html)) {
+    return NextResponse.json({ error: "Unrecognised report document" }, { status: 400 });
+  }
+  const r = getRedis();
+  if (!r) return NextResponse.json({ error: "Sharing unavailable — Redis is not configured." }, { status: 503 });
+  const id = reportId();
+  try {
+    await r.set(`report:${id}`, html, { ex: REPORT_TTL });
+    return NextResponse.json({ id, path: `/api/tools?tool=report&id=${id}`, expires_days: 30 });
+  } catch (e) {
+    return NextResponse.json({ error: e instanceof Error ? e.message : "Could not save report" }, { status: 500 });
+  }
+}
+
+async function handleReportView(req: NextRequest) {
+  const id = (req.nextUrl.searchParams.get("id") || "").replace(/[^a-z0-9]/gi, "").slice(0, 32);
+  const notFound = (msg: string) => new NextResponse(
+    `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Report unavailable</title>
+     <style>body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#0f172a;display:grid;place-items:center;height:100vh;margin:0;background:#f8fafc}
+     div{text-align:center;max-width:30rem;padding:2rem}h1{font-size:19px;margin:0 0 .5rem}p{color:#64748b;margin:0}</style></head>
+     <body><div><h1>This report link is no longer available</h1><p>${msg}</p></div></body></html>`,
+    { status: 404, headers: { "content-type": "text/html; charset=utf-8" } });
+
+  if (!id) return notFound("The link is missing its report id.");
+  const r = getRedis();
+  if (!r) return notFound("Report storage is not configured.");
+  const html = await r.get<string>(`report:${id}`).catch(() => null);
+  if (!html) return notFound("Shared reports expire 30 days after they are created.");
+  return new NextResponse(String(html), {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      // Immutable content under a random id — safe to cache hard, and keeps it off
+      // search engines since these contain a customer's analytics.
+      "cache-control": "public, max-age=3600",
+      "x-robots-tag": "noindex, nofollow",
+    },
+  });
+}
+
 // ── Editorial Calendar ────────────────────────────────────────────────────────
+// Research-first pipeline. Before planning anything we scrape the site, pull its
+// DataForSEO domain metrics, discover competitors from live SERPs and mine the
+// keywords those competitors rank for that the site does not. The calendar is then
+// planned against a fixed asset quota rather than "4 posts per month".
+
+// Aggregators and social platforms are never treated as content competitors.
+const CAL_NOISE = new Set([
+  "reddit.com", "wikipedia.org", "youtube.com", "linkedin.com", "facebook.com", "twitter.com", "x.com",
+  "quora.com", "medium.com", "pinterest.com", "instagram.com", "amazon.com", "indeed.com",
+  "glassdoor.com", "tiktok.com", "github.com", "stackoverflow.com",
+]);
+
+// Minimum deliverables per calendar: >=10 blogs, >=2 case studies, >=1 ebook, >=1 report,
+// plus supporting formats. Floors hold for a 1-month plan and scale with plan length.
+function calendarQuota(n: number) {
+  return [
+    { asset: "blog", min: Math.max(10, 4 * n), words: "1200-2200" },
+    { asset: "case-study", min: Math.max(2, Math.ceil(n / 1.5)), words: "1000-1600" },
+    { asset: "ebook", min: Math.max(1, Math.floor(n / 3)), words: "4000-7000" },
+    { asset: "report", min: Math.max(1, Math.floor(n / 3)), words: "2500-4000" },
+    { asset: "whitepaper", min: n >= 3 ? 1 : 0, words: "2000-3500" },
+    { asset: "webinar", min: n >= 3 ? 1 : 0, words: "600-900" },
+    { asset: "infographic", min: n >= 2 ? 1 : 0, words: "300-600" },
+    { asset: "checklist", min: n >= 2 ? 1 : 0, words: "600-1000" },
+  ].filter(a => a.min > 0);
+}
+
+// Spread `total` items across `n` months as evenly as possible.
+function spreadAcross(total: number, n: number): number[] {
+  const out = new Array<number>(n).fill(0);
+  for (let i = 0; i < total; i++) out[i % n]++;
+  return out;
+}
+
+type CalGap = { keyword: string; volume: number; kd: number; comp_pos: number | null; competitor: string };
+type CalCompetitor = { domain: string; appearances: number; keywords: number; traffic: number; gap_keywords: CalGap[] };
+type CalResearch = {
+  site: { domain: string; title: string; description: string; h1: string; headings: string[]; pages_found: number; top_pages: string[]; keywords: number; traffic: number; top10: number; existing_paths: string[] };
+  industry: string;
+  seed_keywords: string[];
+  competitors: CalCompetitor[];
+  gaps: CalGap[];
+  sources: string[];
+};
+
+// Phase 1-4 of the research. Every external call is failure-tolerant: a calendar is still
+// produced (on thinner evidence) when DataForSEO is unconfigured or a fetch times out.
+async function calendarResearch(host: string, userKws: string[], manualComps: string[]): Promise<CalResearch> {
+  const base = `https://${host}`;
+  const sources: string[] = [];
+
+  // ── Phase 1: the site itself ──
+  const siteCalls = await Promise.allSettled([
+    fetchHtml(base),
+    getSitemapUrls(base, 150),
+    dfsConfigured() ? dfsDomainOverview(host) : Promise.resolve(null),
+    dfsConfigured() ? dfsTopPages(host, 25) : Promise.resolve(null),
+  ]);
+  const ok = <T>(i: number): T | null =>
+    siteCalls[i].status === "fulfilled" ? ((siteCalls[i] as PromiseFulfilledResult<T>).value ?? null) : null;
+
+  const home = ok<{ html: string | null }>(0);
+  const page = home?.html ? parsePage(home.html, base) : null;
+  const sitemap = ok<string[]>(1) || [];
+  const overview = ok<{ keywords: number; traffic: number; top3: number; top10: number }>(2);
+  const topPages = ok<string[]>(3) || [];
+  if (page) sources.push("homepage");
+  if (sitemap.length) sources.push(`sitemap (${sitemap.length} urls)`);
+  if (overview) sources.push("dataforseo domain overview");
+  if (topPages.length) sources.push("dataforseo top pages");
+
+  // Path segments of what is already published — used to steer the plan away from duplicates.
+  const existingPaths = sitemap
+    .map(u => { try { return new URL(u).pathname; } catch { return ""; } })
+    .filter(p => p && p !== "/")
+    .slice(0, 80);
+
+  // ── Phase 2: seed keywords — derive them from the page when the user supplied none ──
+  let seeds = userKws.slice();
+  let industry = "";
+  const compHints = manualComps.slice();
+  if (seeds.length === 0) {
+    const snapshot = [page?.title, page?.metaDesc, page?.h1, ...(page?.h2s || []).slice(0, 12)]
+      .filter(Boolean).join(" | ").slice(0, 1200);
+    try {
+      const t = await callAI(`Website: ${host}. Homepage signals: ${snapshot || "unavailable"}. Known page paths: ${existingPaths.slice(0, 25).join(", ") || "unknown"}.
+Return ONLY JSON {"keywords":["kw1","kw2","kw3","kw4","kw5","kw6","kw7","kw8"],"industry":"string","competitors":["domain1.com","domain2.com","domain3.com"]}
+— commercial-intent SEO keywords this company should compete for, its industry, and its most likely direct competitor domains.`, 800, true);
+      const d = parseJSON(t) as { keywords?: string[]; industry?: string; competitors?: string[] };
+      seeds = (d.keywords || []).map(String).filter(Boolean).slice(0, 8);
+      industry = String(d.industry || "");
+      (d.competitors || []).forEach(c => { const cd = cleanDomain(String(c)); if (cd && cd !== host) compHints.push(cd); });
+      if (seeds.length) sources.push("ai keyword derivation");
+    } catch { /* keyword derivation is best-effort */ }
+  }
+
+  // ── Phase 3: competitors from live SERPs ──
+  const tally = new Map<string, number>();
+  const serps = await Promise.allSettled(seeds.slice(0, 3).map(k => fetchSERP(k)));
+  serps.forEach(s => {
+    if (s.status !== "fulfilled") return;
+    s.value.results.slice(0, 10).forEach(r => {
+      const d = cleanDomain(r.domain);
+      if (!d || d === host || CAL_NOISE.has(d)) return;
+      tally.set(d, (tally.get(d) || 0) + 1);
+    });
+  });
+  if (tally.size) sources.push(`live serps (${seeds.slice(0, 3).length} keywords)`);
+  const discovered = [...tally.entries()].sort((a, b) => b[1] - a[1]).map(([d]) => d);
+  // User-named competitors first, then the domains that show up most across the seed SERPs.
+  const chosen = [...new Set([...compHints, ...discovered])].filter(d => d && d !== host).slice(0, 3);
+
+  // ── Phase 4: what each competitor ranks for that we do not ──
+  const compSettled = await Promise.allSettled(chosen.map(async (c): Promise<CalCompetitor> => {
+    const [ov, gap] = await Promise.all([
+      dfsConfigured() ? dfsDomainOverview(c).catch(() => null) : Promise.resolve(null),
+      // target1 ranks for these, target2 (us) does not — so mine is target2.
+      dfsConfigured() ? dfsIntersection(c, host, { intersections: false, limit: 20, mineIsTarget1: false }).catch(() => null) : Promise.resolve(null),
+    ]);
+    return {
+      domain: c,
+      appearances: tally.get(c) || 0,
+      keywords: ov?.keywords || 0,
+      traffic: ov?.traffic || 0,
+      gap_keywords: (gap || []).slice(0, 15).map(g => ({ keyword: g.keyword, volume: g.volume, kd: g.kd, comp_pos: g.comp_pos, competitor: c })),
+    };
+  }));
+  const competitorsOut = compSettled
+    .filter((r): r is PromiseFulfilledResult<CalCompetitor> => r.status === "fulfilled")
+    .map(r => r.value);
+  if (competitorsOut.some(c => c.gap_keywords.length)) sources.push("dataforseo keyword intersection");
+
+  // Highest-volume gap keywords across every competitor, deduped.
+  const seenKw = new Set<string>();
+  const gaps = competitorsOut
+    .flatMap(c => c.gap_keywords)
+    .sort((a, b) => b.volume - a.volume)
+    .filter(g => { const k = g.keyword.toLowerCase(); if (seenKw.has(k)) return false; seenKw.add(k); return true; })
+    .slice(0, 40);
+
+  return {
+    site: {
+      domain: host,
+      title: page?.title || "",
+      description: page?.metaDesc || "",
+      h1: page?.h1 || "",
+      headings: (page?.h2s || []).slice(0, 12),
+      pages_found: sitemap.length,
+      top_pages: topPages.slice(0, 12),
+      keywords: overview?.keywords || 0,
+      traffic: overview?.traffic || 0,
+      top10: overview?.top10 || 0,
+      existing_paths: existingPaths.slice(0, 40),
+    },
+    industry,
+    seed_keywords: seeds,
+    competitors: competitorsOut,
+    gaps,
+    sources,
+  };
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function handleCalendar(body: any) {
-  const { domain, keywords = [], months = 3, audience = "", goals = "" } = body;
+  const { domain, keywords = [], months = 3, audience = "", goals = "", competitors = [] } = body;
   if (!domain) return NextResponse.json({ error: "No domain" }, { status: 400 });
-  const kwList = Array.isArray(keywords) ? keywords.slice(0, 20).join(", ") : String(keywords);
 
-  // Build the month labels starting from the CURRENT month, so the calendar is never stale.
+  const host = cleanDomain(String(domain));
   const n = Math.max(1, Math.min(12, Number(months) || 3));
+
+  // Month labels always start from the CURRENT month, so the calendar is never stale.
   const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
   const now = new Date();
   const monthLabels = Array.from({ length: n }, (_, i) => {
@@ -490,25 +1030,141 @@ async function handleCalendar(body: any) {
     return `${MONTH_NAMES[dt.getMonth()]} ${dt.getFullYear()}`;
   });
 
-  const prompt = `You are an expert SEO content strategist. Generate a ${n}-month editorial calendar for ${domain}, starting from the CURRENT month.
-Use EXACTLY these month labels, in this exact order, for the "month" field — do NOT invent other months or years: ${monthLabels.join(", ")}.
-Context: keywords: ${kwList || "derive from domain"}, audience: ${audience || "general business"}, goals: ${goals || "drive organic traffic"}
-Return ONLY valid JSON:
-{
-  "months": [{"month":"${monthLabels[0]}","theme":"string","posts":[{"week":1,"title":"string","type":"guide|listicle|case-study|how-to|comparison|news|interview","keywords":["kw"],"angle":"string","word_count":1200,"schema":"Article|HowTo|FAQPage|none","priority":"high|medium|low","intent":"informational|commercial|navigational|transactional"}]}],
-  "content_mix": {"guides":30,"listicles":25,"how_tos":20,"comparisons":15,"case_studies":10},
-  "pillar_topics": ["topic1","topic2","topic3"],
-  "quick_wins": ["idea1","idea2","idea3"]
-}
-Produce exactly ${n} month objects whose "month" values are ${monthLabels.join(", ")} in that order, with 4 posts per month (one per week), specific and actionable for ${domain}.`;
+  const asList = (v: unknown) => (Array.isArray(v) ? v : String(v || "").split(","))
+    .map(x => String(x).trim()).filter(Boolean);
+  const userKws = asList(keywords).slice(0, 20);
+  const manualComps = asList(competitors).map(c => cleanDomain(c)).filter(Boolean).slice(0, 5);
+
+  // This route caps at maxDuration 120s. Research + strategy + n month passes can get close
+  // on a 6-month plan, so the optional top-up pass is skipped once we run out of headroom.
+  const startedAt = Date.now();
+  const headroomLeft = () => Date.now() - startedAt < 85000;
 
   try {
-    const text = await callAI(prompt, 4096, true);
-    const calendar = parseJSON(text) as { months?: { month?: string }[] };
-    // Force the month labels to the real current-month sequence regardless of the model.
-    if (calendar && Array.isArray(calendar.months)) {
-      calendar.months.forEach((m, i) => { if (i < monthLabels.length) m.month = monthLabels[i]; });
+    // ── Research ──
+    const research = await calendarResearch(host, userKws, manualComps);
+
+    const quota = calendarQuota(n);
+    // Deterministic allocation: decide the exact slate per month in code, so the quota
+    // holds regardless of how well the model counts.
+    const perMonth: Record<string, number>[] = Array.from({ length: n }, () => ({}));
+    quota.forEach(q => spreadAcross(q.min, n).forEach((c, i) => { if (c > 0) perMonth[i][q.asset] = c; }));
+    const wordsFor = Object.fromEntries(quota.map(q => [q.asset, q.words]));
+
+    // Compact research digest reused by every downstream prompt.
+    const compLine = research.competitors.length
+      ? research.competitors.map(c => `${c.domain} (${c.keywords.toLocaleString()} kws, ~${c.traffic.toLocaleString()} traffic/mo, ranks for ${c.gap_keywords.length} keywords we don't)`).join("; ")
+      : "none identified";
+    const gapLine = research.gaps.slice(0, 25).map(g => `${g.keyword} (vol ${g.volume}, kd ${g.kd}, ${g.competitor} at #${g.comp_pos ?? "?"})`).join("; ") || "none";
+    const digest = `SITE: ${host} — "${research.site.title}". ${research.site.description}
+Homepage H1: ${research.site.h1}. Section headings: ${research.site.headings.join(", ") || "n/a"}.
+Organic footprint: ${research.site.keywords.toLocaleString()} ranking keywords, ~${research.site.traffic.toLocaleString()} monthly organic traffic, ${research.site.top10} in top 10. ${research.site.pages_found} URLs in sitemap.
+Already published (do NOT duplicate these): ${research.site.existing_paths.slice(0, 30).join(", ") || "unknown"}
+Top ranking pages: ${research.site.top_pages.slice(0, 8).join(", ") || "unknown"}
+Industry: ${research.industry || "infer from the above"}
+Seed keywords: ${research.seed_keywords.join(", ") || "derive from the site"}
+COMPETITORS: ${compLine}
+COMPETITOR KEYWORD GAPS (they rank, we don't — prioritise these): ${gapLine}
+Audience: ${audience || "infer from the site"}. Goals: ${goals || "organic growth + pipeline"}.`;
+
+    // ── Strategy pass: synthesise the research into pillars, angles and month themes ──
+    let strategy: { positioning?: string; icp?: string; pillar_topics?: string[]; quick_wins?: string[]; competitor_insights?: { domain: string; what_they_win: string; how_to_beat: string }[]; month_themes?: string[] } = {};
+    try {
+      const t = await callAI(`You are an expert B2B SEO content strategist. Below is REAL research on a website and its competitors.
+${digest}
+
+Return ONLY valid JSON:
+{"positioning":"one sentence on how this site should position its content","icp":"who the content is for","pillar_topics":["p1","p2","p3","p4","p5"],"quick_wins":["w1","w2","w3","w4","w5"],"competitor_insights":[{"domain":"string","what_they_win":"string","how_to_beat":"string"}],"month_themes":[${monthLabels.map(m => `"theme for ${m}"`).join(",")}]}
+Ground every pillar and quick win in the competitor gap keywords above. Return exactly ${n} month_themes.`, 2000, true);
+      strategy = parseJSON(t) as typeof strategy;
+    } catch { /* strategy is additive; the month passes can stand alone */ }
+
+    const themes = strategy.month_themes || [];
+    const insights = (strategy.competitor_insights || []).map(c => `${c.domain}: wins on ${c.what_they_win} → beat by ${c.how_to_beat}`).join("; ");
+
+    // ── Month passes: one call per month, in parallel, each given its exact asset slate ──
+    // Gap keywords are dealt out across months so no two months chase the same terms.
+    const gapChunks: CalGap[][] = Array.from({ length: n }, () => []);
+    research.gaps.forEach((g, i) => gapChunks[i % n].push(g));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const monthCalls = await Promise.allSettled(monthLabels.map(async (label, i): Promise<any> => {
+      const slate = perMonth[i];
+      const slateLine = Object.entries(slate).map(([a, c]) => `${c}x ${a} (${wordsFor[a]} words each)`).join(", ");
+      const total = Object.values(slate).reduce((a, b) => a + b, 0);
+      const myGaps = gapChunks[i].slice(0, 12).map(g => `${g.keyword} (vol ${g.volume}, kd ${g.kd})`).join("; ");
+      const t = await callAI(`You are an expert B2B SEO content strategist planning ONE month of an editorial calendar.
+${digest}
+Strategy: ${strategy.positioning || ""} Audience: ${strategy.icp || audience || ""}
+Pillars: ${(strategy.pillar_topics || []).join(", ") || "derive"}
+Competitor angles: ${insights || "n/a"}
+
+MONTH: ${label}${themes[i] ? ` — theme: ${themes[i]}` : ""}
+Prioritise these gap keywords this month: ${myGaps || "use the seed keywords"}
+
+Produce EXACTLY ${total} assets for this month with EXACTLY this mix: ${slateLine}.
+Spread them across weeks 1-4. Each title must be specific to ${host} and its industry — no generic filler.
+
+Return ONLY valid JSON:
+{"month":"${label}","theme":"string","posts":[{"week":1,"title":"string","asset":"blog|case-study|ebook|report|whitepaper|webinar|infographic|checklist","type":"guide|listicle|case-study|how-to|comparison|news|interview","keywords":["kw"],"angle":"string","word_count":1500,"schema":"Article|HowTo|FAQPage|none","priority":"high|medium|low","intent":"informational|commercial|navigational|transactional","funnel_stage":"TOFU|MOFU|BOFU","gated":false,"cta":"string"}]}
+The "asset" field must match the required mix exactly. Set "gated":true for ebook, report and whitepaper. For non-blog assets set "type" to the same value as "asset".`, 8192, true);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const m = parseJSON(t) as any;
+      m.month = label;
+      if (!Array.isArray(m.posts)) m.posts = [];
+      return m;
+    }));
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const monthsOut: any[] = monthCalls.map((r, i) =>
+      r.status === "fulfilled" ? r.value : { month: monthLabels[i], theme: themes[i] || "", posts: [] });
+
+    // ── Quota check + top-up ──
+    // The model can under-deliver on the rarer assets; count what actually came back and
+    // ask for only the shortfall rather than shipping a calendar that misses the floor.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const countAsset = (a: string) => monthsOut.reduce((s, m) => s + (m.posts || []).filter((p: any) => String(p.asset || "blog") === a).length, 0);
+    const deficits = quota.map(q => ({ ...q, have: countAsset(q.asset) })).filter(q => q.have < q.min);
+    if (deficits.length && headroomLeft()) {
+      const need = deficits.map(d => `${d.min - d.have}x ${d.asset} (${d.words} words each)`).join(", ");
+      try {
+        const t = await callAI(`You are an expert B2B SEO content strategist topping up an editorial calendar for ${host}.
+${digest}
+Pillars: ${(strategy.pillar_topics || []).join(", ") || "derive"}
+Already planned titles (do NOT repeat): ${monthsOut.flatMap(m => (m.posts || []).map((p: { title: string }) => p.title)).slice(0, 60).join("; ")}
+
+Produce EXACTLY these additional assets: ${need}.
+Return ONLY valid JSON: {"posts":[{"week":1,"title":"string","asset":"string","type":"string","keywords":["kw"],"angle":"string","word_count":1500,"schema":"Article|HowTo|FAQPage|none","priority":"high|medium|low","intent":"informational|commercial|navigational|transactional","funnel_stage":"TOFU|MOFU|BOFU","gated":false,"cta":"string"}]}`, 4096, true);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const extra = (parseJSON(t) as any)?.posts;
+        if (Array.isArray(extra)) extra.forEach((p, i) => { const m = monthsOut[i % n]; (m.posts = m.posts || []).push(p); });
+      } catch { /* top-up is best-effort — the shortfall is reported below either way */ }
     }
+
+    // Normalise, then report the mix actually delivered so the UI can show it honestly.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    monthsOut.forEach(m => (m.posts || []).forEach((p: any) => {
+      p.asset = String(p.asset || "blog");
+      p.type = String(p.type || p.asset);
+      p.week = Math.max(1, Math.min(4, Number(p.week) || 1));
+      if (p.gated === undefined) p.gated = ["ebook", "report", "whitepaper"].includes(p.asset);
+    }));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    monthsOut.forEach(m => (m.posts || []).sort((a: any, b: any) => a.week - b.week));
+
+    const mix = quota.map(q => ({ asset: q.asset, required: q.min, planned: countAsset(q.asset) }));
+
+    const calendar = {
+      months: monthsOut,
+      asset_mix: mix,
+      shortfall: mix.filter(m => m.planned < m.required),
+      pillar_topics: strategy.pillar_topics || [],
+      quick_wins: strategy.quick_wins || [],
+      positioning: strategy.positioning || "",
+      icp: strategy.icp || "",
+      competitor_insights: strategy.competitor_insights || [],
+      research,
+    };
     return NextResponse.json({ calendar });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : "Failed" }, { status: 500 });
@@ -572,6 +1228,38 @@ async function checkPerplexityVisibility(questions: string[], brandRe: RegExp): 
   const hits = await Promise.all(questions.slice(0, 6).map(ask));
   const mentioned = hits.filter(Boolean).length;
   return Math.round((mentioned / hits.length) * 100);
+}
+
+// ChatGPT cross-check: ask the SAME questions on OpenAI's chat models and return the %
+// of answers that mention the brand. Gated on OPENAI_API_KEY — with no key this returns
+// null and ChatGPT is simply omitted from the platform list, exactly like Perplexity.
+const OPENAI_VIS_MODELS = ["gpt-5.6-luna", "gpt-5.6-terra"];
+async function checkOpenAIVisibility(questions: string[], brandRe: RegExp): Promise<number | null> {
+  const key = (process.env.OPENAI_API_KEY || "").replace(/^﻿/, "").trim();
+  if (!key || !questions.length) return null;
+  const ask = async (q: string): Promise<boolean> => {
+    for (const model of OPENAI_VIS_MODELS) {
+      try {
+        const r = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+          // Answer as a normal user would see it — no system prompt steering the brand in.
+          body: JSON.stringify({ model, messages: [{ role: "user", content: q }] }),
+          signal: AbortSignal.timeout(20000),
+        });
+        if (!r.ok) continue;   // model retired / no access → try the next one
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const j = await r.json() as any;
+        const text = j?.choices?.[0]?.message?.content || "";
+        if (text) return brandRe.test(text);
+      } catch { /* try next model */ }
+    }
+    return false;
+  };
+  try {
+    const hits = await Promise.all(questions.slice(0, 6).map(ask));
+    return Math.round((hits.filter(Boolean).length / hits.length) * 100);
+  } catch { return null; }
 }
 
 // Gemini cross-check: ask the SAME questions on Gemini (Google's AI answer engine)
@@ -652,13 +1340,16 @@ Exactly 6 results.`;
       const platforms = [{ platform: "Claude", mentioned: mentionedCount > 0, rate: claudeRate }];
 
       // ── Multi-engine: cross-check the SAME questions on Gemini + Perplexity ──
-      // Gemini uses the existing Google AI Studio key (always on); Perplexity is gated on its key.
+      // Gemini uses the existing Google AI Studio key (always on); ChatGPT and Perplexity
+      // are each gated on their own key and are omitted entirely when it is absent.
       const questions = verified.map(r => r.question);
-      const [gemRate, ppxRate] = await Promise.all([
+      const [gemRate, gptRate, ppxRate] = await Promise.all([
         checkGeminiVisibility(questions, brandRe).catch(() => null),
+        checkOpenAIVisibility(questions, brandRe).catch(() => null),
         checkPerplexityVisibility(questions, brandRe).catch(() => null),
       ]);
       if (gemRate !== null) platforms.push({ platform: "Gemini", mentioned: gemRate > 0, rate: gemRate });
+      if (gptRate !== null) platforms.push({ platform: "ChatGPT", mentioned: gptRate > 0, rate: gptRate });
       if (ppxRate !== null) platforms.push({ platform: "Perplexity", mentioned: ppxRate > 0, rate: ppxRate });
       const overallRate = Math.round(platforms.reduce((a, p) => a + p.rate, 0) / platforms.length);
 
@@ -738,9 +1429,11 @@ Exactly 6 results.`;
   // Source breakdown (real)
   const total = Math.max(newsCount + redditPosts + ddgCount, 1);
   const source_breakdown = [
-    { source: "Google News",  count: newsCount,   pct: Math.round(newsCount/total*100),   recent: recentNews,  color: "#4285f4" },
-    { source: "Reddit",       count: redditPosts, pct: Math.round(redditPosts/total*100), recent: redditPosts, color: "#ff4500" },
-    { source: "Web mentions", count: ddgCount,    pct: Math.round(ddgCount/total*100),    recent: 0,           color: "#10a37f" },
+    // Brand Guidelines 2025 palette (Compunnel Blue + secondary, p.17/19) rather than each
+    // platform's own colour, so charts read as one system across the app and the reports.
+    { source: "Google News",  count: newsCount,   pct: Math.round(newsCount/total*100),   recent: recentNews,  color: "#0050EF" },
+    { source: "Reddit",       count: redditPosts, pct: Math.round(redditPosts/total*100), recent: redditPosts, color: "#FFAB00" },
+    { source: "Web mentions", count: ddgCount,    pct: Math.round(ddgCount/total*100),    recent: 0,           color: "#05D9E8" },
   ];
 
   // Recent articles (real)
@@ -1102,8 +1795,11 @@ async function handleCampaignStrategy(body: any) {
 
   // When the project is Eximius, ground the strategy in the built-in knowledge base so company,
   // ICP, messaging and CTA come out accurate/on-brand even if the GTM/brief is sparse.
-  const kbBlock = isEximiusProject(`${gtm} ${brief} ${domain}`)
+  const strategySignal = `${gtm} ${brief} ${domain}`;
+  const kbBlock = isEximiusProject(strategySignal)
     ? `\n\n${EXIMIUS_KB}\n\nUse the EXIMIUS BRAND KNOWLEDGE BASE above as the authoritative source when it conflicts with, or fills gaps in, the documents below. Set "company" to "Eximius" and "cta" to "Book a free pilot".`
+    : isCompunnelProject(strategySignal)
+    ? `\n\n${COMPUNNEL_BRAND}\n\nUse the COMPUNNEL BRAND KNOWLEDGE BASE above as the authoritative source for voice, positioning and company facts when it conflicts with, or fills gaps in, the documents below. Set "company" to "Compunnel".`
     : "";
 
   const prompt = `You are an SEO strategy parser. Extract a unified strategy from the GTM document and Campaign Brief below.
@@ -1146,6 +1842,15 @@ async function handleCampaignSuggestions(body: any) {
   const keywords: string[] = Array.isArray(strategy.target_keywords) ? strategy.target_keywords.slice(0, 8) : [];
   if (!keywords.length) return NextResponse.json({ error: "No target keywords in strategy" }, { status: 400 });
 
+  // When the campaign is configured as a listing, every suggested title must read as a
+  // ranked roundup — otherwise the writer receives listing rules but a prose-style title.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const LS: any = strategy.listing && typeof strategy.listing === "object" ? strategy.listing : null;
+  const listingHint = LS && String(LS.subject || "").trim()
+    ? `
+
+LISTING CAMPAIGN: every suggestion must be a ranked roundup. Titles must take the form "Top N <thing>" (N = ${Math.max(3, Math.min(25, Number(LS.count) || 5))}), built around "${String(LS.subject).trim()}" and its close variations (by use case, by company size, by region, alternatives-to). Set "content_type":"listicle" on every item.`
+    : "";
   // Ground in real SERP for up to 5 seed keywords (who ranks, avg words)
   const cleanDomain = domain.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "").toLowerCase();
   const serp = await Promise.allSettled(keywords.slice(0, 5).map(async kw => {
@@ -1172,7 +1877,7 @@ Return ONLY valid JSON:
       "title": "SEO-optimised page/blog title",
       "target_keyword": "primary keyword",
       "semantic_keywords": ["variant1","variant2"],
-      "content_type": "blog post|landing page|comparison page|case study|FAQ page",
+      "content_type": "blog post|landing page|comparison page|case study|FAQ page|listicle",
       "category": "NEW PILLAR|NEW CLUSTER ARTICLE|UPDATE EXISTING|CONSOLIDATE|REPURPOSE",
       "cluster": "pillar/cluster topic this belongs to",
       "priority": "Critical|High|Medium",
@@ -1182,7 +1887,7 @@ Return ONLY valid JSON:
     }
   ]
 }
-Generate 8-12 suggestions across categories, grounded in the real SERP data.`;
+Generate 8-12 suggestions across categories, grounded in the real SERP data.${listingHint}`;
   try {
     const text = await callAI(prompt, 4096, true);
     return NextResponse.json({ result: parseJSON(text), serp_grounded: serpCtx.length > 0 });
@@ -1280,7 +1985,7 @@ async function callCampaignClaude(prompt: string, maxTokens: number): Promise<st
           max_tokens: Math.min(Math.max(Number(maxTokens) || 4096, 1024), 32000),
           messages: [{ role: "user", content: prompt }],
         }),
-        signal: AbortSignal.timeout(85000),
+        signal: AbortSignal.timeout(104000),   // research is a separate request now, so the writer owns the budget
       });
       if (r.status === 429 || r.status === 529) { lastErr = `Claude ${r.status}`; await sleep(1500 * (attempt + 1)); continue; }
       if (!r.ok) {
@@ -1383,6 +2088,10 @@ async function researchLivePage(url: string, keyword = ""): Promise<LivePageRese
 // Phase 5 — Generate full content for one approved suggestion (SERP-NLP grounded + humanized)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function handleCampaignContent(body: any) {
+  // Anchor the budget at REQUEST ENTRY. SERP + live-page research below runs before
+  // generation starts and measured ~32s in production; a deadline anchored after it
+  // overshoots the function limit by exactly that much.
+  const reqStart = Date.now();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const s = body.suggestion || {};
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1405,6 +2114,22 @@ async function handleCampaignContent(body: any) {
   // Real external URLs to cite (from the SERP) + real internal pages to link (from the sitemap).
   let citationSources: { url: string; title: string }[] = [];
   let internalLinks: { url: string; title: string }[] = [];
+  // Research is the single biggest fixed cost in this route (~32s measured) and generation
+  // needs ~80s, which together overflow the 120s function limit. The client can therefore run
+  // research as its OWN request (research_only) and hand the result back here, so each call
+  // comfortably fits. Passing nothing keeps the original single-shot behaviour.
+  const preRes = body.research && typeof body.research === "object" ? body.research : null;
+  if (preRes) {
+    nlpTerms          = preRes.nlp_terms  || [];
+    paaContext        = preRes.paa        || "";
+    researchedTitles  = preRes.titles     || [];
+    researchedOutline = preRes.outline    || [];
+    citationSources   = preRes.citations  || [];
+    internalLinks     = preRes.internal   || [];
+    competitorResearch= preRes.competitors|| [];
+    clientResearch    = preRes.client     || null;
+  }
+  if (!preRes) {
   try {
     const { results } = await fetchSERP(s.target_keyword || s.title);
     // Pick the top competitor URLs (exclude the client's own domain) + the client's own page.
@@ -1422,7 +2147,7 @@ async function handleCampaignContent(body: any) {
     ]);
     const [comps, client] = await Promise.race([
       researchAll,
-      new Promise<[(LivePageResearch | null)[], LivePageResearch | null]>(resolve => setTimeout(() => resolve([[], null]), 11000)),
+      new Promise<[(LivePageResearch | null)[], LivePageResearch | null]>(resolve => setTimeout(() => resolve([[], null]), 8000)),
     ]);
     competitorResearch = (comps || []).filter(Boolean) as LivePageResearch[];
     clientResearch = client;
@@ -1432,7 +2157,10 @@ async function handleCampaignContent(body: any) {
       const snippets = results.slice(0, 8).map(r => `${r.title}. ${r.snippet}`).join("\n");
       // Feed the REAL competitor section headings (not just snippets) into the structure research.
       const compCoverage = competitorResearch.map((c, i) => `(${i + 1}) ${cleanDomain(c.url)} [${c.wordCount}w] H2s: ${(c.h2s || []).slice(0, 8).join(" | ") || "n/a"}`).join("\n");
-      const raw = await callAI(
+      // Bounded: research is grounding, not the deliverable. Losing title options is far
+      // cheaper than losing the article, so this call gets a hard 14s ceiling.
+      const raw = await Promise.race([
+        callAI(
         `You are an SEO content researcher. Using the REAL top-ranking Google results and the competitors' ACTUAL section headings below for "${s.target_keyword}", do title + structure research for a NEW article that can outrank them.\n` +
         `Return ONLY JSON: {` +
         `"nlp_terms":["15-20 entities/phrases a competing article must include"],` +
@@ -1441,7 +2169,10 @@ async function handleCampaignContent(body: any) {
         `"outline":["8-12 H2 section headings phrased as natural questions, derived from what the top pages ACTUALLY cover plus the PAA questions, logically ordered and non-redundant; include at least 2 angles the competitors miss"]}` +
         `\n\nTOP RANKING TITLES:\n${topTitles}\n\nCOMPETITOR SECTION COVERAGE (real H2s from the pages that rank):\n${compCoverage || "(unavailable)"}\n\nTOP SNIPPETS:\n${snippets.slice(0, 2200)}`,
         1100, true
-      );
+        ).catch(() => ""),
+        new Promise<string>(res => setTimeout(() => res(""), 14000)),
+      ]);
+      if (!raw) throw new Error("research call timed out");
       const p = parseJSON(raw) as { nlp_terms?: string[]; questions?: string[]; title_options?: string[]; outline?: string[] };
       nlpTerms = p.nlp_terms || [];
       paaContext = (p.questions || []).join("; ");
@@ -1500,6 +2231,14 @@ async function handleCampaignContent(body: any) {
         .slice(0, 8);
     }
   } catch { /* interlinking optional */ }
+  }
+  if (body.research_only) {
+    return NextResponse.json({ research: {
+      nlp_terms: nlpTerms, paa: paaContext, titles: researchedTitles, outline: researchedOutline,
+      citations: citationSources, internal: internalLinks,
+      competitors: competitorResearch, client: clientResearch,
+    } });
+  }
   // Structure block fed into the writer — the researched title options + H2 outline.
   const structureBlock = (researchedTitles.length || researchedOutline.length)
     ? `\n\nSERP-RESEARCHED STRUCTURE (based on what currently ranks + People Also Ask — follow it):${researchedTitles.length ? `\nBest title options (pick the strongest or refine it; keep the primary keyword, 50-60 chars): ${researchedTitles.join(" | ")}` : ""}${researchedOutline.length ? `\nH2 outline to follow — turn each into a question-format <h2>, answer it in the first sentence, keep this order, and add real depth under each:\n${researchedOutline.map(h => `- ${h}`).join("\n")}` : ""}`
@@ -1538,6 +2277,27 @@ async function handleCampaignContent(body: any) {
   const guardrailBlock = guardrails
     ? `\n\nGUARDRAILS (MANDATORY — these are non-negotiable brand/compliance rules supplied by the client; obey them exactly, and where they conflict with any other instruction, THE GUARDRAILS WIN):\n${guardrails}`
     : "";
+  // ── Listing ("Top N …") mode ──
+  // When the campaign is configured as a listing, the writer must produce a ranked roundup
+  // rather than a prose article: a fixed number of numbered entries, each covering the same
+  // facets, plus selection criteria, a comparison table and a verdict. Kept as a hard block
+  // (like guardrails) because a soft hint produces an essay that merely mentions some brands.
+  const L = strategy.listing && typeof strategy.listing === "object" ? strategy.listing : null;
+  const listCount = L ? Math.max(3, Math.min(25, Number(L.count) || 5)) : 0;
+  const listSubject = L ? String(L.subject || "").trim().slice(0, 120) : "";
+  const listingBlock = (listCount && listSubject)
+    ? `
+
+LISTING FORMAT (MANDATORY — this piece is a ranked roundup, not a prose article):
+- Title and H1 must read as a ranked list, e.g. "Top ${listCount} ${listSubject}".
+- Open with the direct-answer paragraph naming the top 3 picks, then Key Takeaways, then a short "How we evaluated" section stating the selection criteria (3-5 concrete criteria).
+- Then EXACTLY ${listCount} entries, each as its own <h2> numbered in rank order: "<h2>1. Name</h2>", "<h2>2. Name</h2>", and so on through ${listCount}.
+- Every entry must cover, in this order: what it is in one sentence; who it is best for; 2-4 concrete strengths; 1-2 honest limitations. Use <p> and a short <ul>. Never write a limitation-free entry — a roundup with no downsides reads as advertising and will not be trusted.
+- Name REAL, currently-operating ${listSubject}. Do NOT invent companies, products, pricing or customer counts. If you are unsure of a specific figure, describe the capability qualitatively instead of stating a number.
+- After the entries, add a comparison <table> with one row per entry and 3-4 comparable columns (for example: best for, pricing model, standout capability).
+- Close with a short verdict section recommending which entry suits which situation.
+- Do NOT rank the client's own brand first by default. Include it only where it genuinely belongs on merit, and say plainly what it is not suited for.`
+    : "";
   // Built-in Eximius knowledge base — auto-applied when the project/brand/domain is Eximius so
   // generated content is factually accurate and on-brand (correct features/limitations, no
   // unverified compliance claims, right CTA, never "Compunnel"). Facts here win over defaults.
@@ -1550,6 +2310,8 @@ async function handleCampaignContent(body: any) {
   ].filter(Boolean).join(" ");
   const kbBlock = isEximiusProject(eximiusSignal)
     ? `\n\n${EXIMIUS_KB}`
+    : isCompunnelProject(eximiusSignal)
+    ? `\n\n${COMPUNNEL_BRAND}`
     : "";
   // For Eximius, lock the CTA to the approved one unless the brief set a specific override.
   if (kbBlock) {
@@ -1603,7 +2365,7 @@ PERSUASION, BRAND & PROOF (this is what separates expert content from generic co
 - External statistics: use ONLY real, well-known sources (Gartner, McKinsey, SHRM, Glassdoor, Harvard Business Review, LinkedIn) with a year, and pair each stat with a relevant capability. Never fabricate URLs or numbers.
 - Tone: confident and outcome-driven, built on a signal-vs-noise framing. Take a clear point of view. Proofread for clean grammar and correct punctuation.
 - CTA: end with the EXACT briefed CTA "${strategy.cta || "Contact us"}"${strategy.cta_url ? ` and link it to ${strategy.cta_url}` : ""}. Never substitute a different CTA (e.g. do not write "sign up for a free trial" unless that is the briefed CTA).
-- Keep answers self-contained — avoid "as mentioned above"; each passage should make sense quoted on its own.${structureBlock}${competitorBlock}${clientBlock}${interlinkBlock}${citationBlock}${lengthMandate}${kbBlock}${guardrailBlock}`;
+- Keep answers self-contained — avoid "as mentioned above"; each passage should make sense quoted on its own.${structureBlock}${competitorBlock}${clientBlock}${interlinkBlock}${citationBlock}${lengthMandate}${kbBlock}${guardrailBlock}${listingBlock}`;
 
   // Claude path: delimited sections (raw HTML, no JSON escaping) — far more reliable for long bodies.
   const claudePrompt = `${baseInstr}
@@ -1638,6 +2400,21 @@ Return ONLY valid JSON:
 
   try {
     const t0 = Date.now();
+    // Hard wall-clock budget. The route dies at maxDuration (120s) and returns text/plain,
+    // which the client cannot parse — so every OPTIONAL enhancement must be abandoned in
+    // time to still serialize a real response. 100s leaves ~20s for link rewriting, schema
+    // building and serialization, which are regex/JSON work measured in milliseconds.
+    const DEADLINE = reqStart + 111000;
+    const remaining = () => DEADLINE - Date.now();
+    // Race optional work against the remaining budget. A guard that only checks the time
+    // BEFORE starting a call is not enough: the call itself can run for another 85s.
+    const withBudget = async <T>(work: Promise<T>, fallback: T, ms = remaining()): Promise<T> => {
+      if (ms <= 0) return fallback;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<T>(res => { timer = setTimeout(() => res(fallback), ms); });
+      try { return await Promise.race([work.catch(() => fallback), timeout]); }
+      finally { if (timer) clearTimeout(timer); }
+    };
     // Scale the output token budget to the target length (HTML tags cost extra tokens).
     const genTokens = Math.min(Math.max(Math.round(targetWc * 2.2) + 3000, 8000), 22000);
     // Primary: dedicated campaign Claude key (best content). Fall back to the global chain (Groq → …).
@@ -1659,7 +2436,7 @@ Return ONLY valid JSON:
         // 1) Framing: title, meta, direct answer, key takeaways, FAQs (one small call).
         const headRaw = await callCampaignClaude(
           `Write the framing for an SEO + AEO article titled "${s.title}" (primary keyword "${s.target_keyword}"${brand ? `, brand ${brand}` : ""}). US English, no em dashes.\n` +
-          `Return ONLY JSON: {"title":"final H1, 50-60 chars, includes the keyword","slug":"url-slug-with-hyphens","meta_title":"50-60 chars","meta_description":"140-160 chars","hook":"2-3 short sentences of raw HTML (<p>…</p>) that open with a strong, specific hook dramatizing the stakes behind the keyword. Vary the approach for this topic (a contrarian claim, a surprising stat, a sharp question, a myth to bust, or a costly mistake). BANNED openers: a clock time or time-of-day scene (e.g. 'It's 9 a.m. on a Monday'), 'Imagine', 'Picture this', 'In today's/recent years', 'In the world of', or a dictionary definition.","direct_answer":"40-55 word self-contained answer to the primary query (start with the keyword if definitional)","key_takeaways":["3-5 short standalone factual bullets"],"faqs":[{"q":"question","a":"answer"}]} with exactly 5 faqs.${clientBlock}${kbBlock}${guardrailBlock}`,
+          `Return ONLY JSON: {"title":"final H1, 50-60 chars, includes the keyword","slug":"url-slug-with-hyphens","meta_title":"50-60 chars","meta_description":"140-160 chars","hook":"2-3 short sentences of raw HTML (<p>…</p>) that open with a strong, specific hook dramatizing the stakes behind the keyword. Vary the approach for this topic (a contrarian claim, a surprising stat, a sharp question, a myth to bust, or a costly mistake). BANNED openers: a clock time or time-of-day scene (e.g. 'It's 9 a.m. on a Monday'), 'Imagine', 'Picture this', 'In today's/recent years', 'In the world of', or a dictionary definition.","direct_answer":"40-55 word self-contained answer to the primary query (start with the keyword if definitional)","key_takeaways":["3-5 short standalone factual bullets"],"faqs":[{"q":"question","a":"answer"}]} with exactly 5 faqs.${clientBlock}${kbBlock}${guardrailBlock}${listingBlock}`,
           1500,
         );
         const head = parseJSON(headRaw) as { title?: string; slug?: string; meta_title?: string; meta_description?: string; hook?: string; direct_answer?: string; key_takeaways?: string[]; faqs?: { q: string; a: string }[] };
@@ -1679,7 +2456,7 @@ Return ONLY valid JSON:
         // which would empty sections and collapse the length. One retry per section.
         const sections: string[] = [];
         for (const h of headings) {
-          if ((Date.now() - t0) > 75000) break;
+          if (remaining() < 25000) break;   // need room for the call to FINISH, not just start
           let sec = await writeSection(h).catch(() => "");
           if (!/<h2/i.test(sec)) sec = await writeSection(h).catch(() => "");
           if (/<h2/i.test(sec)) sections.push(sec);
@@ -1705,13 +2482,22 @@ Return ONLY valid JSON:
 
     // ── FALLBACK: single-shot (when no outline, or sectioned generation failed) ──
     if (!content || typeof content.article_html !== "string" || !content.article_html) {
+      // Bounded by the remaining wall-clock budget. Unbounded, this call plus the full
+      // provider cascade below can run past maxDuration, and the route then returns
+      // text/plain FUNCTION_INVOCATION_TIMEOUT that the client cannot parse at all.
       try {
-        const text = await callCampaignClaude(claudePrompt, genTokens);
+        const text = await withBudget(callCampaignClaude(claudePrompt, genTokens), "", remaining() - 5000);
+        if (!text) throw new Error("generation budget exhausted");
         content = parseDelimitedContent(text);
         if (!content.article_html || content.article_html.length < 200) throw new Error("Claude output too short");
       } catch {
-        const text = await callAI(jsonPrompt, genTokens, true);
-        content = parseJSON(text);
+        // Only attempt the fallback chain if there is genuinely time for it.
+        if (remaining() > 30000) {
+          const text = await withBudget(callAI(jsonPrompt, genTokens, true), "", remaining() - 12000);
+          content = text ? parseJSON(text) : null;
+        } else {
+          content = null;
+        }
       }
     }
     // Length enforcement: models resist "make this longer", so instead generate NET-NEW
@@ -1720,7 +2506,8 @@ Return ONLY valid JSON:
     if (content && typeof content.article_html === "string" && targetWc >= 1000) {
       let got = wordCountOf(content.article_html);
       let rounds = 0;
-      while (got < minWc && rounds < 5 && (Date.now() - t0) < 75000) {
+      // Need enough headroom for a round to actually FINISH, not just to start one.
+      while (got < minWc && rounds < 5 && remaining() > 20000) {
         rounds++;
         try {
           const existing = (content.article_html.match(/<h2[^>]*>([\s\S]*?)<\/h2>/gi) || [])
@@ -1729,7 +2516,8 @@ Return ONLY valid JSON:
           const addPrompt = `Write ${addCount} ADDITIONAL, NON-redundant question-format sections for an in-depth article about "${s.target_keyword}"${brand ? ` (for ${brand})` : ""}.
 Each section: a natural-language question as <h2>, answered in the first sentence, then ~${perSection} words of genuinely useful detail with concrete examples, real numbers/data, and a <h3> sub-point or a short <ul>. Cover NEW sub-topics — do NOT repeat any of these existing sections: ${existing || "(none)"}.
 Rules: US English, NO em dashes (use commas/periods), ZERO markdown (only <h2>/<h3>/<p>/<ul>/<li>/<strong>/<a>), human and specific (not generic). Output ONLY the raw HTML for the new sections — no preamble, no code fences.`;
-          const more = await callCampaignClaude(addPrompt, genTokens);
+          const more = await withBudget(callCampaignClaude(addPrompt, genTokens), "", remaining() - 8000);
+          if (!more) break; // ran out of budget mid-round — ship what we have
           const add = deAiContent(more.replace(/^```[a-z]*\s*/i, "").replace(/```$/, "").trim());
           if (add.length > 120 && /<h2/i.test(add)) {
             content.article_html = `${content.article_html}\n${add}`;
@@ -1803,6 +2591,10 @@ Rules: US English, NO em dashes (use commas/periods), ZERO markdown (only <h2>/<
       // Final pass: strip any em/en dashes that slipped into the appended FAQ/hook.
       content.article_html = content.article_html.replace(/(\d)\s*[–—]\s*(\d)/g, "$1-$2").replace(/\s*[–—]\s*/g, ", ");
     }
+    if (!content || typeof content.article_html !== "string" || !content.article_html) {
+      const secs = Math.round((Date.now() - reqStart) / 1000);
+      return NextResponse.json({ error: `Generation ran out of time (${secs}s of a 120s limit). Try a shorter target word count.` }, { status: 503 });
+    }
     // Build/validate schema server-side (always valid JSON-LD regardless of the model)
     const sch = buildSchemas(content, domain, brand, s.title, s.target_keyword);
     content.schema_article = content.schema_article || sch.article;
@@ -1812,6 +2604,7 @@ Rules: US English, NO em dashes (use commas/periods), ZERO markdown (only <h2>/<
     content.word_count = typeof content.article_html === "string" ? wordCountOf(content.article_html) : 0;
     content.target_word_count = targetWc;
     content.research = { title_options: researchedTitles, outline: researchedOutline };
+    content.gen_ms = Date.now() - t0;   // wall-clock spent generating, for budget diagnosis
     return NextResponse.json({ content, nlp_terms: nlpTerms });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : "Failed" }, { status: 500 });
@@ -2255,4 +3048,168 @@ async function handleLinkProspects(body: any) {
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : "Prospecting failed" }, { status: 500 });
   }
+}
+
+// ── SEO Opportunity Engine ────────────────────────────────────────────────────
+// Scores the full GSC keyword set against five opportunity modules: striking
+// distance, low CTR, content decay, competitor gap (DataForSEO) and keyword
+// cannibalisation. Returns scored + ranked actions the UI renders as a digest.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function handleSeoEngine(body: any, _req: NextRequest) {
+  const domain = cleanDomain(body.domain || "");
+  if (!domain) return NextResponse.json({ error: "No domain" }, { status: 400 });
+
+  const competitors = (Array.isArray(body.competitors) ? body.competitors : []).map(cleanDomain).filter(Boolean).slice(0, 5);
+  const brandPattern = body.brandRegex || domain.split(".")[0];
+  let brand: RegExp;
+  try { brand = new RegExp(brandPattern, "i"); } catch { brand = new RegExp(brandPattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); }
+  const CTR_CURVE = [0.28, 0.15, 0.10, 0.07, 0.05, 0.04, 0.03, 0.025, 0.02, 0.018];
+
+  // GSC data is pre-fetched by the frontend via /api/gsc?mode=seoengine (which handles auth).
+  const gscData = body.gscData;
+  if (!gscData?.queryPages?.rows) return NextResponse.json({ error: "No GSC data provided. The frontend must fetch it first via /api/gsc?mode=seoengine." }, { status: 400 });
+
+  const period = gscData.period || {};
+
+  // DataForSEO gap analysis (runs server-side)
+  const gapResults = (dfsConfigured() && competitors.length)
+    ? await Promise.all(competitors.map((comp: string) =>
+        dfsIntersection(comp, domain, { intersections: false, limit: 200, locationName: "United States", mineIsTarget1: false }).catch(() => null)
+      ))
+    : [] as (GapKeyword[] | null)[];
+
+  type GscRow = { keys: string[]; clicks: number; impressions: number; ctr: number; position: number };
+  const qpRows = (gscData.queryPages.rows || []) as GscRow[];
+  const pageCur = (gscData.pagesCurrent?.rows || []) as GscRow[];
+  const pagePrev = (gscData.pagesPrior?.rows || []) as GscRow[];
+
+  if (qpRows.length < 5) {
+    return NextResponse.json({ warning: true, error: `GSC returned only ${qpRows.length} rows for ${domain}. The site may have very little search traffic, or the data isn't available yet.` });
+  }
+
+  // ── Aggregate query×page into per-query stats ──
+  const byQ = new Map<string, { keyword: string; clicks: number; impressions: number; posW: number; pages: { page: string; impressions: number }[] }>();
+  for (const r of qpRows) {
+    const [q, page] = r.keys;
+    const a = byQ.get(q) || { keyword: q, clicks: 0, impressions: 0, posW: 0, pages: [] };
+    a.clicks += r.clicks; a.impressions += r.impressions; a.posW += r.position * r.impressions;
+    a.pages.push({ page, impressions: r.impressions });
+    byQ.set(q, a);
+  }
+  const queries = [...byQ.values()].map(a => {
+    a.pages.sort((x, y) => y.impressions - x.impressions);
+    return {
+      keyword: a.keyword, clicks: a.clicks, impressions: a.impressions,
+      position: a.posW / (a.impressions || 1), ctr: a.clicks / (a.impressions || 1),
+      top_url: a.pages[0]?.page || "",
+      competing: a.pages.filter(p => p.impressions >= a.impressions * 0.15).length,
+    };
+  }).filter(q => !brand.test(q.keyword) && q.keyword.split(" ").length <= 10);
+
+  // ── Module 1: Striking distance (pos 4-20, 50+ impressions) ──
+  // Gain = what reaching position 3 would yield minus current clicks (using the CTR curve)
+  const striking = queries.filter(q => q.position >= 4 && q.position <= 20 && q.impressions >= 50)
+    .map(q => {
+      const targetCtr = CTR_CURVE[2];
+      return { keyword: q.keyword, url: q.top_url, position: +q.position.toFixed(1), impressions: q.impressions, clicks: q.clicks, ctr: +(q.ctr * 100).toFixed(1), gain: Math.max(0, Math.round(q.impressions * targetCtr - q.clicks)) };
+    })
+    .sort((a, b) => b.gain - a.gain);
+
+  // ── Module 2: Low CTR (pos 1-10, 200+ impr, CTR < 75% of expected) ──
+  const lowCtr = queries.filter(q => q.position <= 10 && q.impressions >= 200)
+    .map(q => {
+      const exp = CTR_CURVE[Math.min(9, Math.max(0, Math.round(q.position) - 1))];
+      return { keyword: q.keyword, url: q.top_url, position: +q.position.toFixed(1), impressions: q.impressions, clicks: q.clicks, ctr: +(q.ctr * 100).toFixed(1), expected_ctr: +(exp * 100).toFixed(1), gain: Math.max(0, Math.round(q.impressions * exp - q.clicks)) };
+    })
+    .filter(q => q.ctr < q.expected_ctr * 0.75)
+    .sort((a, b) => b.gain - a.gain);
+
+  // ── Module 3: Content decay (pages losing >=20% clicks) ──
+  // Normalize URLs before comparison to avoid phantom decay from trailing-slash or protocol differences.
+  const normUrl = (u: string) => u.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
+  const NON_CONTENT_RE = /^[^?#]*\/(contact|about|careers|jobs|login|signup|register|cart|checkout|account|privacy|terms|404|search)(?:[\/-]|$)|^[^?#]*\/$/;
+  const curClickMap = new Map<string, number>();
+  for (const r of pageCur) curClickMap.set(normUrl(r.keys[0]), (curClickMap.get(normUrl(r.keys[0])) || 0) + r.clicks);
+  const decay = pagePrev.filter(r => r.clicks >= 10)
+    .filter(r => {
+      const path = normUrl(r.keys[0]);
+      if (NON_CONTENT_RE.test(path)) return false;
+      const segments = path.replace(/^[^/]*/, "").split("/").filter(Boolean);
+      return segments.length >= 1;
+    })
+    .map(r => {
+      const cur = curClickMap.get(normUrl(r.keys[0])) ?? 0;
+      return { page: r.keys[0], clicks_prev: r.clicks, clicks_cur: cur, change: Math.round(((cur - r.clicks) / r.clicks) * 100), gain: Math.max(0, r.clicks - cur) };
+    })
+    .filter(r => r.change <= -20)
+    .sort((a, b) => b.gain - a.gain);
+
+  // ── Module 4: Cannibalisation (2+ URLs share >=15% impressions) ──
+  const cannibal = queries.filter(q => q.competing >= 2 && q.impressions >= 100)
+    .map(q => {
+      const a = byQ.get(q.keyword);
+      const urls = (a?.pages || []).filter(p => p.impressions >= q.impressions * 0.15).map(p => p.page);
+      return { keyword: q.keyword, impressions: q.impressions, urls_competing: urls.length, urls: urls.slice(0, 5), position: +q.position.toFixed(1) };
+    })
+    .filter(q => q.urls_competing >= 2)
+    .sort((a, b) => b.impressions - a.impressions);
+
+  // ── Module 5: Competitor gap (DataForSEO) ──
+  // Build a topical stem set from the site's own keywords to filter for relevance.
+  const ownStems = new Set<string>();
+  for (const q of queries) {
+    for (const w of q.keyword.toLowerCase().split(/\s+/)) {
+      if (w.length >= 4) ownStems.add(w);
+    }
+  }
+  const gap: { keyword: string; volume: number; kd: number; comp_pos: number; competitor: string; gain: number }[] = [];
+  const ownTop10 = new Set(queries.filter(q => q.position <= 10).map(q => q.keyword.toLowerCase()));
+  if (Array.isArray(gapResults)) {
+    for (let i = 0; i < competitors.length && i < gapResults.length; i++) {
+      const missing = gapResults[i];
+      if (!Array.isArray(missing)) continue;
+      for (const kw of missing) {
+        if (brand.test(kw.keyword) || ownTop10.has(kw.keyword.toLowerCase())) continue;
+        if (kw.volume < 100 || kw.kd > 40 || kw.comp_pos == null || kw.comp_pos > 10) continue;
+        const words = kw.keyword.toLowerCase().split(/\s+/);
+        const relevant = words.some((w: string) => w.length >= 4 && ownStems.has(w));
+        if (!relevant) continue;
+        const posCtr = CTR_CURVE[Math.min(9, Math.max(0, (kw.comp_pos || 5) - 1))];
+        gap.push({ keyword: kw.keyword, volume: kw.volume, kd: kw.kd, comp_pos: kw.comp_pos, competitor: competitors[i], gain: Math.round(kw.volume * posCtr) });
+      }
+    }
+  }
+  gap.sort((a, b) => b.gain - a.gain);
+
+  // ── Action queue (all modules, ranked by estimated monthly clicks gained) ──
+  const sliceStriking = striking.slice(0, 100);
+  const sliceLowctr = lowCtr.slice(0, 100);
+  const sliceDecay = decay.slice(0, 50);
+  const sliceGap = gap.slice(0, 100);
+  const sliceCannibal = cannibal.slice(0, 50);
+  const queue = [
+    ...sliceStriking.slice(0, 30).map(s => ({ module: "striking" as const, keyword: s.keyword, url: s.url, gain: s.gain, action: "Optimise page" })),
+    ...sliceLowctr.slice(0, 20).map(s => ({ module: "lowctr" as const, keyword: s.keyword, url: s.url, gain: s.gain, action: "Rewrite title/meta" })),
+    ...sliceDecay.slice(0, 20).map(s => ({ module: "decay" as const, keyword: "", url: s.page, gain: s.gain, action: "Refresh page" })),
+    ...sliceGap.slice(0, 30).map(s => ({ module: "gap" as const, keyword: s.keyword, url: "", gain: s.gain, action: "New article" })),
+  ].sort((a, b) => b.gain - a.gain);
+
+  return NextResponse.json({
+    domain,
+    period: period,
+    summary: {
+      striking: { count: sliceStriking.length, gain: sliceStriking.reduce((s, x) => s + x.gain, 0) },
+      lowctr: { count: sliceLowctr.length, gain: sliceLowctr.reduce((s, x) => s + x.gain, 0) },
+      decay: { count: sliceDecay.length, gain: sliceDecay.reduce((s, x) => s + x.gain, 0) },
+      gap: { count: sliceGap.length, gain: sliceGap.reduce((s, x) => s + x.gain, 0) },
+      cannibal: { count: sliceCannibal.length },
+      dataForSeo: dfsConfigured(),
+    },
+    striking: sliceStriking,
+    lowctr: sliceLowctr,
+    decay: sliceDecay,
+    gap: sliceGap,
+    cannibal: sliceCannibal,
+    queue: queue.slice(0, 50),
+  });
 }
