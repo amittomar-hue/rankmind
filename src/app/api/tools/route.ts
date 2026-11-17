@@ -3124,13 +3124,13 @@ async function handleSeoEngine(body: any, _req: NextRequest) {
     .filter(q => q.ctr < q.expected_ctr * 0.75)
     .sort((a, b) => b.gain - a.gain);
 
-  // ── Module 3: Content decay (pages losing >=20% clicks) ──
+  // ── Module 3: Content decay (pages losing >=20% clicks over 90-day windows) ──
   // Normalize URLs before comparison to avoid phantom decay from trailing-slash or protocol differences.
   const normUrl = (u: string) => u.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
   const NON_CONTENT_RE = /^[^?#]*\/(contact|about|careers|jobs|login|signup|register|cart|checkout|account|privacy|terms|404|search)(?:[\/-]|$)|^[^?#]*\/$/;
   const curClickMap = new Map<string, number>();
   for (const r of pageCur) curClickMap.set(normUrl(r.keys[0]), (curClickMap.get(normUrl(r.keys[0])) || 0) + r.clicks);
-  const decay = pagePrev.filter(r => r.clicks >= 10)
+  const decay = pagePrev.filter(r => r.clicks >= 30)
     .filter(r => {
       const path = normUrl(r.keys[0]);
       if (NON_CONTENT_RE.test(path)) return false;
@@ -3141,7 +3141,7 @@ async function handleSeoEngine(body: any, _req: NextRequest) {
       const cur = curClickMap.get(normUrl(r.keys[0])) ?? 0;
       return { page: r.keys[0], clicks_prev: r.clicks, clicks_cur: cur, change: Math.round(((cur - r.clicks) / r.clicks) * 100), gain: Math.max(0, r.clicks - cur) };
     })
-    .filter(r => r.change <= -20)
+    .filter(r => r.change <= -20 && r.gain >= 10)
     .sort((a, b) => b.gain - a.gain);
 
   // ── Module 4: Cannibalisation (2+ URLs share >=15% impressions) ──

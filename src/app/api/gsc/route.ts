@@ -191,7 +191,7 @@ export async function GET(req: NextRequest) {
   const mode = req.nextUrl.searchParams.get("mode");
   if (mode === "seoengine") {
     const day = (n: number) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
-    const seFrom = day(-30), seTo = day(-3), sePrevFrom = day(-58), sePrevTo = day(-31);
+    const seFrom = day(-90), seTo = day(-3), sePrevFrom = day(-177), sePrevTo = day(-91);
     const runSE = async (tok: string) => {
       const hdr = { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" };
       const f = (b: object) => fetch(endpoint, { method: "POST", headers: hdr, body: JSON.stringify(b) }).then(r => r.json());
