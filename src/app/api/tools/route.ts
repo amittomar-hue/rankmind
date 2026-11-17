@@ -3127,7 +3127,7 @@ async function handleSeoEngine(body: any, _req: NextRequest) {
   // ── Module 3: Content decay (pages losing >=20% clicks over 90-day windows) ──
   // Normalize URLs before comparison to avoid phantom decay from trailing-slash or protocol differences.
   const normUrl = (u: string) => u.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
-  const NON_CONTENT_RE = /^[^?#]*\/(contact|about|careers|jobs|login|signup|register|cart|checkout|account|privacy|terms|404|search)(?:[\/-]|$)|^[^?#]*\/$/;
+  const NON_CONTENT_RE = /^[^?#]*\/(contact|about|careers|jobs|login|signup|register|cart|checkout|account|privacy|terms|404|search|services|industry|solutions|pricing|demo|platform|features|integrations|partners|case-studies|testimonials|faq|support|help)(?:[\/-]|$)|^[^?#]*\/$/;
   const curClickMap = new Map<string, number>();
   for (const r of pageCur) curClickMap.set(normUrl(r.keys[0]), (curClickMap.get(normUrl(r.keys[0])) || 0) + r.clicks);
   const decay = pagePrev.filter(r => r.clicks >= 30)
